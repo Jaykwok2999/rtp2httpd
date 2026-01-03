@@ -1,9 +1,8 @@
 name: Release
 
-on:
-  release:
-    types:
-      - published
+on: 
+  repository_dispatch:
+  workflow_dispatch:
 
 jobs:
   versioned:
