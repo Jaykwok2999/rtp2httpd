@@ -1,9 +1,16 @@
 name: Release
 
-on:
-  release:
-    types:
-      - published
+on: 
+  repository_dispatch:
+  workflow_dispatch:
+
+# 定时触发编译
+  schedule:
+    - cron: 0 22 * * *
+
+# 点赞☆Star触发编译
+#  watch:
+#    types: [started]
 
 jobs:
   versioned:
