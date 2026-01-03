@@ -38,7 +38,10 @@ jobs:
         
         
          
-        git clone --depth=1 https://github.com/stackia/rtp2httpd ./
+        git clone https://github.com/stackia/rtp2httpd.git ./tmp
+        mv ./tmp/* ./
+        rm -rf ./tmp
+        
         
         
         
