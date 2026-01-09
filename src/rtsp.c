@@ -586,8 +586,10 @@ int rtsp_parse_server_url(rtsp_session_t *session, const char *rtsp_url,
 
           /* URL decode */
           if (http_url_decode(start_str) == 0) {
-            snprintf(session->r2h_start, sizeof(session->r2h_start), "%s", start_str);
-            logger(LOG_DEBUG, "Found r2h-start parameter: %s", session->r2h_start);
+            snprintf(session->r2h_start, sizeof(session->r2h_start), "%s",
+                     start_str);
+            logger(LOG_DEBUG, "Found r2h-start parameter: %s",
+                   session->r2h_start);
           } else {
             logger(LOG_ERROR, "Failed to decode r2h-start parameter");
           }
@@ -640,15 +642,17 @@ int rtsp_parse_server_url(rtsp_session_t *session, const char *rtsp_url,
           if (strcmp(duration_str, "1") == 0) {
             session->r2h_duration = 1;
             logger(LOG_INFO,
-                   "Duration request detected via query parameter(r2h-duration) for URL: %s",
+                   "Duration request detected via query "
+                   "parameter(r2h-duration) for URL: %s",
                    rtsp_url);
           }
           free(duration_str);
         }
 
         /* Remove r2h-duration parameter from URL */
-        char *param_start =
-            (r2h_duration > query_start + 1) ? (r2h_duration - 1) : r2h_duration;
+        char *param_start = (r2h_duration > query_start + 1)
+                                ? (r2h_duration - 1)
+                                : r2h_duration;
         if (r2h_duration == query_start + 1) {
           /* First parameter */
           if (*value_end == '&') {
@@ -937,6 +941,17 @@ int rtsp_handle_socket_event(rtsp_session_t *session, uint32_t events) {
     } else if (events & (EPOLLHUP | EPOLLRDHUP)) {
       logger(LOG_INFO, "RTSP: Server closed connection");
     }
+
+    /* If we're in TEARDOWN states, server closing connection is acceptable
+     * (some servers don't send TEARDOWN response before closing) */
+    if (session->state == RTSP_STATE_SENDING_TEARDOWN ||
+        session->state == RTSP_STATE_AWAITING_TEARDOWN) {
+      logger(LOG_DEBUG,
+             "RTSP: Server closed connection during TEARDOWN (acceptable)");
+      rtsp_force_cleanup(session);
+      return -2; /* Graceful teardown completion */
+    }
+
     rtsp_session_set_state(session, RTSP_STATE_ERROR);
     return -1; /* Connection closed or error */
   }
@@ -1052,7 +1067,8 @@ int rtsp_handle_socket_event(rtsp_session_t *session, uint32_t events) {
       if (response_result < 0) {
         logger(LOG_ERROR, "RTSP: Failed to receive response");
         rtsp_session_set_state(session, RTSP_STATE_ERROR);
-        if (response_result == -3) return -3;
+        if (response_result == -3)
+          return -3;
         return -1;
       }
 
@@ -1387,37 +1403,38 @@ static int rtsp_try_receive_response(rtsp_session_t *session) {
              session->response_buffer + data_after_header_end);
     }
 
-    if (session->r2h_duration && session->state == RTSP_STATE_AWAITING_DESCRIBE)
-    {
+    if (session->r2h_duration &&
+        session->state == RTSP_STATE_AWAITING_DESCRIBE) {
       char *body_str = malloc(remaining_data_len + 1);
       if (body_str) {
-        strncpy(body_str, session->response_buffer + data_after_header_end, remaining_data_len);
+        strncpy(body_str,
+                (const char *)session->response_buffer + data_after_header_end,
+                remaining_data_len);
         body_str[remaining_data_len] = '\0';
 
         char *r2h_range = strstr(body_str, "a=range:npt=");
 
         /* Check if at parameter boundary */
-        if (r2h_range)
-        {
+        if (r2h_range) {
           /* Extract value */
           char *value_start = r2h_range + 12; /* Skip "a=range:npt=" */
-          char *value_end = strchr(value_start, '\r\n');
+          char *value_end = strchr(value_start, '\r');
           if (!value_end) {
             value_end = value_start + strlen(value_start);
           }
           size_t value_len = value_end - value_start;
           char *value_str = malloc(value_len + 1);
-          if (value_str)
-          {
+          if (value_str) {
             strncpy(value_str, value_start, value_len);
             value_str[value_len] = '\0';
           }
           float range_start, range_end;
-          if (sscanf(value_str, "%f-%f", &range_start, &range_end)==2) {
-            logger(LOG_DEBUG,"RTSP: Range: %.3f-%.3f", range_start, range_end);
+          if (sscanf(value_str, "%f-%f", &range_start, &range_end) == 2) {
+            logger(LOG_DEBUG, "RTSP: Range: %.3f-%.3f", range_start, range_end);
             session->r2h_duration_value = range_end;
           } else {
-            logger(LOG_DEBUG,"RTSP Range: %s, cannot find right range!", value_str);
+            logger(LOG_DEBUG, "RTSP Range: %s, cannot find right range!",
+                   value_str);
           }
           free(value_str);
         }
@@ -1563,11 +1580,12 @@ static int rtsp_state_machine_advance(rtsp_session_t *session) {
 
   case RTSP_STATE_SETUP:
     if (session->r2h_start[0] != '\0') {
-      snprintf(extra_headers, sizeof(extra_headers), "Session: %s\r\nRange: npt=%s-\r\n",
-                session->session_id, session->r2h_start);
+      snprintf(extra_headers, sizeof(extra_headers),
+               "Session: %s\r\nRange: npt=%s-\r\n", session->session_id,
+               session->r2h_start);
     } else {
       snprintf(extra_headers, sizeof(extra_headers), "Session: %s\r\n",
-                session->session_id);
+               session->session_id);
     }
     if (rtsp_prepare_request(session, RTSP_METHOD_PLAY, extra_headers) < 0) {
       logger(LOG_ERROR, "RTSP: Failed to prepare PLAY request");
@@ -2052,15 +2070,6 @@ int rtsp_session_cleanup(rtsp_session_t *session) {
   return 0; /* Cleanup completed immediately */
 }
 
-int rtsp_session_is_async_teardown(rtsp_session_t *session) {
-  /* Check if session is in async TEARDOWN states where we're waiting for
-   * response */
-  return (session->teardown_requested &&
-          (session->state == RTSP_STATE_SENDING_TEARDOWN ||
-           session->state == RTSP_STATE_AWAITING_TEARDOWN ||
-           session->state == RTSP_STATE_RECONNECTING));
-}
-
 /* Helper functions */
 static int rtsp_parse_response_header(rtsp_session_t *session,
                                       const char *response,
@@ -2323,11 +2332,9 @@ static int rtsp_setup_udp_sockets(rtsp_session_t *session) {
     }
 
     /* Set receive buffer size to 512KB */
-    int rcvbuf_size = UDP_RCVBUF_SIZE;
-    if (setsockopt(rtp_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size,
-                   sizeof(rcvbuf_size)) < 0) {
+    if (set_socket_rcvbuf(rtp_socket, UDP_RCVBUF_SIZE) < 0) {
       logger(LOG_WARN, "RTSP: Failed to set RTP SO_RCVBUF to %d: %s",
-             rcvbuf_size, strerror(errno));
+             UDP_RCVBUF_SIZE, strerror(errno));
     }
 
     bind_to_upstream_interface(rtp_socket, upstream_if);
@@ -2363,11 +2370,9 @@ static int rtsp_setup_udp_sockets(rtsp_session_t *session) {
     }
 
     /* Set receive buffer size to 512KB */
-    rcvbuf_size = UDP_RCVBUF_SIZE;
-    if (setsockopt(rtcp_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size,
-                   sizeof(rcvbuf_size)) < 0) {
+    if (set_socket_rcvbuf(rtcp_socket, UDP_RCVBUF_SIZE) < 0) {
       logger(LOG_WARN, "RTSP: Failed to set RTCP SO_RCVBUF to %d: %s",
-             rcvbuf_size, strerror(errno));
+             UDP_RCVBUF_SIZE, strerror(errno));
     }
 
     bind_to_upstream_interface(rtcp_socket, upstream_if);
