@@ -12,6 +12,8 @@ import {
   PanelRightClose,
   PanelRightOpen,
   PictureInPicture2,
+  History,
+  Tv,
 } from "lucide-react";
 import { Channel, EPGProgram } from "../../types/player";
 import { usePlayerTranslation } from "../../hooks/use-player-translation";
@@ -47,6 +49,9 @@ interface PlayerControlsProps {
   // Sidebar controls
   showSidebar?: boolean;
   onToggleSidebar?: () => void;
+  // Source selector
+  activeSourceIndex?: number;
+  onSourceChange?: (index: number) => void;
 }
 
 export function PlayerControls({
@@ -68,6 +73,8 @@ export function PlayerControls({
   onPiPToggle,
   showSidebar = true,
   onToggleSidebar,
+  activeSourceIndex = 0,
+  onSourceChange,
 }: PlayerControlsProps) {
   const t = usePlayerTranslation(locale);
   const progressBarRef = useRef<HTMLDivElement>(null);
@@ -75,7 +82,8 @@ export function PlayerControls({
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Check if catchup is supported
-  const isCatchupSupported = Boolean(channel.catchup && channel.catchupSource);
+  const activeSource = channel.sources[activeSourceIndex] ?? channel.sources[0];
+  const isCatchupSupported = Boolean(activeSource?.catchup && activeSource?.catchupSource);
 
   const { startTime, endTime, duration } = useMemo(() => {
     if (!currentProgram) {
@@ -283,7 +291,7 @@ export function PlayerControls({
             </button>
 
             {/* Volume Slider */}
-            <div className="absolute bottom-full left-1/2 -translate-x-1/2 rounded bg-black/90 px-2 md:px-3 py-2 shadow-lg cursor-pointer opacity-0 invisible group-hover/volume:opacity-100 group-hover/volume:visible transition-all duration-150">
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 rounded bg-black/60 backdrop-blur-sm px-2 md:px-3 py-2 shadow-lg cursor-pointer opacity-0 invisible group-hover/volume:opacity-100 group-hover/volume:visible transition-all duration-150">
               <input
                 type="range"
                 min="0"
@@ -329,6 +337,37 @@ export function PlayerControls({
               {t("goLive")}
             </button>
           )}
+
+          {/* Source Selector */}
+          {channel.sources.length > 1 && onSourceChange && (
+            <div className="group/source relative flex items-center focus-within:z-10" tabIndex={-1}>
+              <button className="rounded-full px-2 py-1 md:px-2.5 md:py-1.5 text-xs md:text-sm font-medium text-white transition-all hover:bg-white/20 cursor-pointer">
+                {channel.sources[activeSourceIndex]?.label || `${t("source")} ${activeSourceIndex + 1}`}
+              </button>
+              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 rounded bg-black/60 backdrop-blur-sm py-1 shadow-lg opacity-0 invisible group-hover/source:opacity-100 group-hover/source:visible group-focus-within/source:opacity-100 group-focus-within/source:visible transition-all duration-150">
+                {channel.sources.map((source, index) => (
+                  <button
+                    key={index}
+                    onClick={() => onSourceChange(index)}
+                    className={cn(
+                      "block w-full whitespace-nowrap px-3 py-1.5 text-xs md:text-sm text-left transition-colors cursor-pointer",
+                      index === activeSourceIndex ? "text-primary font-medium" : "text-white/80 hover:bg-white/10",
+                    )}
+                  >
+                    <span className="flex items-center gap-2">
+                      {!isLive && source.catchup && source.catchupSource ? (
+                        <History className="h-3 w-3" />
+                      ) : (
+                        <Tv className="h-3 w-3" />
+                      )}
+                      {source.label || `${t("source")} ${index + 1}`}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Fullscreen */}
           <button
             onClick={onFullscreen}

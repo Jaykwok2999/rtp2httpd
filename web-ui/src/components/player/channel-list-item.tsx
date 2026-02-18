@@ -10,10 +10,11 @@ interface ChannelListItemProps {
   isCurrentChannel: boolean;
   handleChannelClick: (channel: Channel) => void;
   locale: Locale;
+  currentProgram?: string;
 }
 
 const ChannelListItemComponent = forwardRef<HTMLDivElement, ChannelListItemProps>(
-  ({ channel, isCurrentChannel, handleChannelClick, locale }, ref) => {
+  ({ channel, isCurrentChannel, handleChannelClick, locale, currentProgram }, ref) => {
     const t = usePlayerTranslation(locale);
 
     const handleClick = useCallback(() => {
@@ -39,13 +40,21 @@ const ChannelListItemComponent = forwardRef<HTMLDivElement, ChannelListItemProps
         <div className="flex-1 overflow-hidden min-w-0">
           <div className="flex items-center gap-1 md:gap-1.5">
             <div className="truncate text-sm md:text-base font-semibold leading-tight">{channel.name}</div>
-            {channel.catchup && (
+            {channel.sources.some((s) => s.catchup && s.catchupSource) && (
               <span title={t("catchup")}>
                 <History className="h-3 w-3 md:h-3.5 md:w-3.5 shrink-0 text-primary" />
               </span>
             )}
           </div>
-          <div className="mt-0.5 truncate text-[10px] md:text-xs text-muted-foreground">{channel.group}</div>
+          <div className="mt-0.5 truncate text-[10px] md:text-xs text-muted-foreground">
+            {channel.group}
+            {currentProgram && (
+              <>
+                <span className="mx-1">·</span>
+                <span>{currentProgram}</span>
+              </>
+            )}
+          </div>
         </div>
         {/* Right: Logo */}
         {channel.logo && (

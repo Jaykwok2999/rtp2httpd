@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useState, useCallback, useMemo, useRef, Activity } from "react";
+import { StrictMode, useEffect, useState, useCallback, useMemo, useRef, Activity, startTransition } from "react";
 import { createRoot } from "react-dom/client";
 import mpegts from "@rtp2httpd/mpegts.js";
 import { Channel, M3UMetadata, PlayMode } from "../types/player";
@@ -24,6 +24,8 @@ import {
   getCatchupTailOffset,
   saveForce16x9,
   getForce16x9,
+  saveLastSourceIndex,
+  getLastSourceIndex,
 } from "../lib/player-storage";
 import { cn } from "../lib/utils";
 
@@ -56,6 +58,17 @@ function PlayerPage() {
   // Track current video playback time in seconds (relative to stream start)
   const [currentVideoTime, setCurrentVideoTime] = useState(0);
 
+  // Track active source index for multi-source channels
+  const [activeSourceIndex, setActiveSourceIndex] = useState(0);
+
+  // Get the active source's URL and catchupSource
+  const activeSource = currentChannel?.sources[activeSourceIndex] ?? currentChannel?.sources[0];
+
+  // Reset currentVideoTime when streamStartTime changes (new stream starts from 0)
+  useEffect(() => {
+    setCurrentVideoTime(0);
+  }, [streamStartTime]);
+
   // Track fullscreen state
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -71,7 +84,7 @@ function PlayerPage() {
   // Track mobile/desktop state
   useEffect(() => {
     const handleResize = () => {
-      setIsMobile(window.innerWidth < 768);
+      startTransition(() => setIsMobile(window.innerWidth < 768));
     };
 
     window.addEventListener("resize", handleResize);
@@ -81,29 +94,35 @@ function PlayerPage() {
   }, []);
 
   useEffect(() => {
-    if (!currentChannel) return;
+    if (!activeSource) return;
 
     const now = new Date();
 
     if (streamStartTime.getTime() > now.getTime() - 3000) {
-      setPlaybackSegments([
-        {
-          url: currentChannel.url,
-          duration: 0,
-        },
-      ]);
+      setPlaybackSegments([{ url: activeSource.url, duration: 0 }]);
       setPlayMode("live");
       return;
     }
 
-    // Check if channel supports catchup
-    if (!currentChannel.catchup || !currentChannel.catchupSource) {
+    // Source supports catchup: use it
+    if (activeSource.catchup && activeSource.catchupSource) {
+      setPlaybackSegments(buildCatchupSegments(activeSource, streamStartTime, catchupTailOffset));
+      setPlayMode("catchup");
       return;
     }
 
-    setPlaybackSegments(buildCatchupSegments(currentChannel, streamStartTime, catchupTailOffset));
-    setPlayMode("catchup");
-  }, [currentChannel, streamStartTime, catchupTailOffset]);
+    // Source doesn't support catchup: try to find another source that does
+    const fallbackIndex = currentChannel?.sources.findIndex(
+      (s, i) => i !== activeSourceIndex && s.catchup && s.catchupSource,
+    );
+    if (fallbackIndex !== undefined && fallbackIndex !== -1) {
+      setActiveSourceIndex(fallbackIndex);
+      return;
+    }
+
+    // No source supports catchup, fall back to live
+    setStreamStartTime(new Date());
+  }, [currentChannel, activeSource, activeSourceIndex, streamStartTime, catchupTailOffset]);
 
   const handleVideoSeek = useCallback(
     (seekTime: Date) => {
@@ -121,8 +140,26 @@ function PlayerPage() {
     [streamStartTime],
   );
 
+  const handleSourceChange = useCallback(
+    (sourceIndex: number) => {
+      if (playMode === "live") {
+        setStreamStartTime(new Date());
+      } else {
+        // Preserve current playback position when switching source in catchup mode
+        setStreamStartTime(new Date(streamStartTime.getTime() + currentVideoTime * 1000));
+      }
+      setActiveSourceIndex(sourceIndex);
+      if (currentChannel) {
+        saveLastSourceIndex(currentChannel.id, sourceIndex);
+      }
+    },
+    [currentChannel, playMode, streamStartTime, currentVideoTime],
+  );
+
   const selectChannel = useCallback((channel: Channel) => {
     setCurrentChannel(channel);
+    const lastSource = getLastSourceIndex(channel.id);
+    setActiveSourceIndex(lastSource < channel.sources.length ? lastSource : 0);
     setStreamStartTime(new Date());
   }, []);
 
@@ -193,18 +230,18 @@ function PlayerPage() {
           .then((epg) => {
             // Fill gaps in EPG data with 2-hour fallback programs for catchup-capable channels
             const filledEpg = fillEPGGaps(epg, parsed.channels);
-            setEpgData(filledEpg);
+            startTransition(() => setEpgData(filledEpg));
           })
           .catch((err) => {
             console.error("Failed to load EPG:", err);
             // Even if EPG loading fails, generate fallback programs for catchup-capable channels
             const fallbackEpg = fillEPGGaps({}, parsed.channels);
-            setEpgData(fallbackEpg);
+            startTransition(() => setEpgData(fallbackEpg));
           });
       } else {
         // No EPG URL provided, generate fallback programs for catchup-capable channels
         const fallbackEpg = fillEPGGaps({}, parsed.channels);
-        setEpgData(fallbackEpg);
+        startTransition(() => setEpgData(fallbackEpg));
       }
 
       // Try to restore last played channel, otherwise select first channel
@@ -340,6 +377,8 @@ function PlayerPage() {
             onToggleSidebar={handleToggleSidebar}
             onFullscreenToggle={handleFullscreenToggle}
             force16x9={force16x9}
+            activeSourceIndex={activeSourceIndex}
+            onSourceChange={handleSourceChange}
           />
         </div>
 
@@ -392,6 +431,7 @@ function PlayerPage() {
                 onChannelSelect={selectChannel}
                 locale={locale}
                 settingsSlot={settingsSlot}
+                epgData={epgData}
               />
             </Activity>
             <Activity mode={sidebarView === "epg" ? "visible" : "hidden"}>
@@ -400,7 +440,7 @@ function PlayerPage() {
                 epgData={epgData}
                 onProgramSelect={handleVideoSeek}
                 locale={locale}
-                supportsCatchup={!!(currentChannel?.catchup && currentChannel?.catchupSource)}
+                supportsCatchup={!!currentChannel?.sources.some((s) => s.catchup && s.catchupSource)}
                 currentPlayingProgram={currentVideoProgram}
               />
             </Activity>
