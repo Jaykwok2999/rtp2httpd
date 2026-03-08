@@ -5,6 +5,8 @@
 #include "http.h" /* For http_url_encode */
 #include "http_proxy_rewrite.h"
 #include "multicast.h"
+#include "platform_compat.h"
+#include "poller.h"
 #include "status.h"
 #include "utils.h"
 #include "worker.h"
@@ -17,7 +19,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -282,6 +283,7 @@ int http_proxy_connect(http_proxy_session_t *session) {
            strerror(errno));
     return -1;
   }
+  platform_set_nosigpipe(session->socket);
 
   /* Set socket to non-blocking mode */
   if (connection_set_nonblocking(session->socket) < 0) {
@@ -311,15 +313,13 @@ int http_proxy_connect(http_proxy_session_t *session) {
       logger(LOG_DEBUG, "HTTP Proxy: Connection to %s:%d in progress (async)",
              session->target_host, session->target_port);
 
-      /* Register socket with epoll for EPOLLOUT to detect connection
+      /* Register socket with poller for POLLER_OUT to detect connection
        * completion */
       if (session->epoll_fd >= 0) {
-        struct epoll_event ev;
-        ev.events = EPOLLOUT | EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-        ev.data.fd = session->socket;
-        if (epoll_ctl(session->epoll_fd, EPOLL_CTL_ADD, session->socket, &ev) <
-            0) {
-          logger(LOG_ERROR, "HTTP Proxy: Failed to add socket to epoll: %s",
+        if (poller_add(session->epoll_fd, session->socket,
+                       POLLER_OUT | POLLER_IN | POLLER_ERR | POLLER_HUP |
+                           POLLER_RDHUP) < 0) {
+          logger(LOG_ERROR, "HTTP Proxy: Failed to add socket to poller: %s",
                  strerror(errno));
           close(session->socket);
           session->socket = -1;
@@ -327,7 +327,7 @@ int http_proxy_connect(http_proxy_session_t *session) {
         }
         fdmap_set(session->socket, session->conn);
         logger(LOG_DEBUG,
-               "HTTP Proxy: Socket registered with epoll for connection");
+               "HTTP Proxy: Socket registered with poller for connection");
       }
 
       session->state = HTTP_PROXY_STATE_CONNECTING;
@@ -347,13 +347,12 @@ int http_proxy_connect(http_proxy_session_t *session) {
   logger(LOG_DEBUG, "HTTP Proxy: Connected immediately to %s:%d",
          session->target_host, session->target_port);
 
-  /* Register socket with epoll */
+  /* Register socket with poller */
   if (session->epoll_fd >= 0) {
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLERR | EPOLLRDHUP;
-    ev.data.fd = session->socket;
-    if (epoll_ctl(session->epoll_fd, EPOLL_CTL_ADD, session->socket, &ev) < 0) {
-      logger(LOG_ERROR, "HTTP Proxy: Failed to add socket to epoll: %s",
+    if (poller_add(session->epoll_fd, session->socket,
+                   POLLER_IN | POLLER_OUT | POLLER_HUP | POLLER_ERR |
+                       POLLER_RDHUP) < 0) {
+      logger(LOG_ERROR, "HTTP Proxy: Failed to add socket to poller: %s",
              strerror(errno));
       close(session->socket);
       session->socket = -1;
@@ -458,46 +457,55 @@ static int http_proxy_try_send_pending(http_proxy_session_t *session) {
   size_t remaining;
   int total_sent = 0;
 
-  /* Phase 1: Send request headers from pending_request buffer */
-  if (session->pending_request_sent < session->pending_request_len) {
+  /* Phase 1: Send request headers from pending_request buffer.
+   * Loop to drain all writable data for edge-triggered pollers. */
+  while (session->pending_request_sent < session->pending_request_len) {
     remaining = session->pending_request_len - session->pending_request_sent;
     sent = send(session->socket,
                 session->pending_request + session->pending_request_sent,
-                remaining, MSG_NOSIGNAL);
+                remaining, MSG_NOSIGNAL | MSG_DONTWAIT);
 
-    if (sent < 0) {
-      if (errno == EAGAIN) {
-        return 0; /* Would block, try again later */
+    if (sent <= 0) {
+      if (sent < 0 && errno == EAGAIN) {
+        return total_sent > 0 ? total_sent : 0;
       }
-      logger(LOG_ERROR, "HTTP Proxy: Send headers failed: %s", strerror(errno));
-      return -1;
+      if (sent < 0) {
+        logger(LOG_ERROR, "HTTP Proxy: Send headers failed: %s",
+               strerror(errno));
+        return -1;
+      }
+      break; /* sent == 0: no progress */
     }
 
     session->pending_request_sent += sent;
     total_sent += (int)sent;
     logger(LOG_DEBUG, "HTTP Proxy: Sent headers %zd bytes (%zu/%zu)", sent,
            session->pending_request_sent, session->pending_request_len);
-
-    /* If headers not fully sent, return and wait for next EPOLLOUT */
-    if (session->pending_request_sent < session->pending_request_len) {
-      return total_sent;
-    }
   }
 
-  /* Phase 2: Send request body directly from request_body pointer */
-  if (session->request_body_len > 0 &&
-      session->request_body_sent < session->request_body_len) {
+  /* If headers not fully sent, wait for next writable event */
+  if (session->pending_request_sent < session->pending_request_len) {
+    return total_sent;
+  }
+
+  /* Phase 2: Send request body directly from request_body pointer.
+   * Loop to drain all writable data for edge-triggered pollers. */
+  while (session->request_body_len > 0 &&
+         session->request_body_sent < session->request_body_len) {
     remaining = session->request_body_len - session->request_body_sent;
     sent = send(session->socket,
                 session->request_body + session->request_body_sent, remaining,
-                MSG_NOSIGNAL);
+                MSG_NOSIGNAL | MSG_DONTWAIT);
 
-    if (sent < 0) {
-      if (errno == EAGAIN) {
-        return total_sent > 0 ? total_sent : 0; /* Headers sent, body blocked */
+    if (sent <= 0) {
+      if (sent < 0 && errno == EAGAIN) {
+        return total_sent > 0 ? total_sent : 0;
       }
-      logger(LOG_ERROR, "HTTP Proxy: Send body failed: %s", strerror(errno));
-      return -1;
+      if (sent < 0) {
+        logger(LOG_ERROR, "HTTP Proxy: Send body failed: %s", strerror(errno));
+        return -1;
+      }
+      break; /* sent == 0: no progress */
     }
 
     session->request_body_sent += sent;
@@ -507,6 +515,159 @@ static int http_proxy_try_send_pending(http_proxy_session_t *session) {
   }
 
   return total_sent;
+}
+
+/**
+ * Finalize M3U body rewriting: rewrite the buffered body and send the
+ * response (headers + rewritten body) to the client.
+ * Called when all body data has been collected or the upstream closed.
+ * @return bytes queued on success, -1 on error
+ */
+static int http_proxy_finalize_rewrite(http_proxy_session_t *session) {
+  int bytes_forwarded = 0;
+
+  if (session->rewrite_body_buffer_used > 0) {
+    /* Null-terminate for rewriting */
+    if (session->rewrite_body_buffer_used >= session->rewrite_body_buffer_size) {
+      char *new_buf = realloc(session->rewrite_body_buffer,
+                              session->rewrite_body_buffer_used + 1);
+      if (!new_buf) {
+        logger(LOG_ERROR, "HTTP Proxy: Failed to grow rewrite buffer for null");
+        return -1;
+      }
+      session->rewrite_body_buffer = new_buf;
+      session->rewrite_body_buffer_size = session->rewrite_body_buffer_used + 1;
+    }
+    session->rewrite_body_buffer[session->rewrite_body_buffer_used] = '\0';
+
+    /* Build base URL and rewrite context */
+    char *base_url = build_proxy_base_url(
+        session->host_header, session->x_forwarded_host, session->x_forwarded_proto);
+    if (!base_url) {
+      logger(LOG_ERROR, "HTTP Proxy: Failed to build base URL for rewriting");
+      return -1;
+    }
+
+    rewrite_context_t ctx = {.upstream_host = session->target_host,
+                             .upstream_port = session->target_port,
+                             .upstream_path = session->target_path,
+                             .base_url = base_url};
+
+    char *rewritten = NULL;
+    size_t rewritten_size = 0;
+
+    int rewrite_result = rewrite_m3u_content(&ctx, session->rewrite_body_buffer,
+                                             &rewritten, &rewritten_size);
+    free(base_url);
+
+    if (rewrite_result < 0) {
+      logger(LOG_ERROR, "HTTP Proxy: M3U rewrite failed");
+      return -1;
+    }
+
+    /* Build and send response headers with new Content-Length
+     * Passthrough original headers except Content-Length and Transfer-Encoding */
+    char headers[HTTP_PROXY_RESPONSE_BUFFER_SIZE];
+    char *hdr_ptr = headers;
+    size_t hdr_remaining = sizeof(headers);
+    int headers_len = 0;
+
+    if (session->saved_response_headers && session->saved_response_headers_len > 0) {
+      /* Parse and rebuild headers from saved original headers */
+      char *saved_copy = strdup(session->saved_response_headers);
+      if (saved_copy) {
+        char *line = strtok(saved_copy, "\r\n");
+        while (line != NULL) {
+          /* Skip headers that need to be modified */
+          if (strncasecmp(line, "Content-Length:", 15) == 0 ||
+              strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+            /* Skip - will add correct Content-Length later */
+          } else {
+            /* Pass through this header */
+            int written = snprintf(hdr_ptr, hdr_remaining, "%s\r\n", line);
+            if (written > 0 && (size_t)written < hdr_remaining) {
+              hdr_ptr += written;
+              hdr_remaining -= written;
+              headers_len += written;
+            }
+          }
+          line = strtok(NULL, "\r\n");
+        }
+        free(saved_copy);
+      }
+
+      /* Add correct Content-Length */
+      int cl_written = snprintf(hdr_ptr, hdr_remaining, "Content-Length: %zu\r\n",
+                                rewritten_size);
+      if (cl_written > 0 && (size_t)cl_written < hdr_remaining) {
+        hdr_ptr += cl_written;
+        hdr_remaining -= cl_written;
+        headers_len += cl_written;
+      }
+    } else {
+      /* Fallback: build minimal headers */
+      headers_len = snprintf(
+          headers, sizeof(headers),
+          "HTTP/1.1 %d OK\r\n"
+          "Content-Type: %s\r\n"
+          "Content-Length: %zu\r\n"
+          "Connection: close\r\n",
+          session->response_status_code, session->response_content_type,
+          rewritten_size);
+      hdr_ptr = headers + headers_len;
+      hdr_remaining = sizeof(headers) - headers_len;
+    }
+
+    /* Inject Set-Cookie header if needed */
+    if (session->conn && session->conn->should_set_r2h_cookie &&
+        config.r2h_token && config.r2h_token[0] != '\0') {
+      int cookie_written = snprintf(
+          hdr_ptr, hdr_remaining,
+          "Set-Cookie: r2h-token=%s; Path=/; HttpOnly; SameSite=Strict\r\n",
+          config.r2h_token);
+      if (cookie_written > 0 && (size_t)cookie_written < hdr_remaining) {
+        hdr_ptr += cookie_written;
+        hdr_remaining -= cookie_written;
+        headers_len += cookie_written;
+      }
+      session->conn->should_set_r2h_cookie = 0;
+    }
+
+    /* Add final CRLF to end headers */
+    int final_written = snprintf(hdr_ptr, hdr_remaining, "\r\n");
+    if (final_written > 0) {
+      headers_len += final_written;
+    }
+
+    if (connection_queue_output(session->conn, (const uint8_t *)headers,
+                                headers_len) < 0) {
+      free(rewritten);
+      logger(LOG_ERROR, "HTTP Proxy: Failed to send rewritten headers");
+      return -1;
+    }
+
+    /* Send rewritten body */
+    if (connection_queue_output(session->conn, (const uint8_t *)rewritten,
+                                rewritten_size) < 0) {
+      free(rewritten);
+      logger(LOG_ERROR, "HTTP Proxy: Failed to send rewritten body");
+      return -1;
+    }
+
+    session->headers_forwarded = 1;
+    if (session->conn) {
+      session->conn->headers_sent = 1;
+    }
+
+    bytes_forwarded = (int)(headers_len + rewritten_size);
+    free(rewritten);
+
+    logger(LOG_DEBUG, "HTTP Proxy: Sent rewritten M3U (%zu bytes body)",
+           rewritten_size);
+  }
+
+  session->state = HTTP_PROXY_STATE_COMPLETE;
+  return bytes_forwarded;
 }
 
 static int http_proxy_try_receive_response(http_proxy_session_t *session) {
@@ -528,28 +689,24 @@ static int http_proxy_try_receive_response(http_proxy_session_t *session) {
       received = recv(session->socket, temp_buf, sizeof(temp_buf), 0);
 
       if (received < 0) {
-        if (errno == EAGAIN) {
+        if (errno == EAGAIN)
           return 0;
-        }
         logger(LOG_ERROR, "HTTP Proxy: Recv failed: %s", strerror(errno));
-        goto process_rewrite_body;
+        return http_proxy_finalize_rewrite(session);
       }
 
       if (received == 0) {
-        /* Connection closed - process buffered body */
         logger(LOG_DEBUG, "HTTP Proxy: Upstream closed, processing rewrite buffer");
-        goto process_rewrite_body;
+        return http_proxy_finalize_rewrite(session);
       }
 
       /* Append to rewrite buffer */
-      {
       size_t new_size = session->rewrite_body_buffer_used + (size_t)received;
       if (new_size > REWRITE_MAX_BODY_SIZE) {
         logger(LOG_ERROR, "HTTP Proxy: Rewrite body exceeds max size");
         return -1;
       }
 
-      /* Grow buffer if needed */
       if (new_size > session->rewrite_body_buffer_size) {
         size_t new_alloc = session->rewrite_body_buffer_size == 0
                                ? 16384
@@ -573,159 +730,13 @@ static int http_proxy_try_receive_response(http_proxy_session_t *session) {
       session->rewrite_body_buffer_used = new_size;
       session->bytes_received += received;
 
-      /* Check if we've received all content */
+      /* All content received — finalize immediately */
       if (session->content_length >= 0 &&
           session->bytes_received >= session->content_length) {
-        goto process_rewrite_body;
-      }
+        return http_proxy_finalize_rewrite(session);
       }
 
       return 0; /* Keep buffering */
-
-    process_rewrite_body:
-      /* Process the buffered body */
-      if (session->rewrite_body_buffer_used > 0) {
-        /* Null-terminate for rewriting */
-        if (session->rewrite_body_buffer_used >= session->rewrite_body_buffer_size) {
-          char *new_buf = realloc(session->rewrite_body_buffer,
-                                  session->rewrite_body_buffer_used + 1);
-          if (!new_buf) {
-            logger(LOG_ERROR, "HTTP Proxy: Failed to grow rewrite buffer for null");
-            return -1;
-          }
-          session->rewrite_body_buffer = new_buf;
-          session->rewrite_body_buffer_size = session->rewrite_body_buffer_used + 1;
-        }
-        session->rewrite_body_buffer[session->rewrite_body_buffer_used] = '\0';
-
-        /* Build base URL and rewrite context */
-        char *base_url = build_proxy_base_url(
-            session->host_header, session->x_forwarded_host, session->x_forwarded_proto);
-        if (!base_url) {
-          logger(LOG_ERROR, "HTTP Proxy: Failed to build base URL for rewriting");
-          return -1;
-        }
-
-        rewrite_context_t ctx = {.upstream_host = session->target_host,
-                                 .upstream_port = session->target_port,
-                                 .upstream_path = session->target_path,
-                                 .base_url = base_url};
-
-        char *rewritten = NULL;
-        size_t rewritten_size = 0;
-
-        int rewrite_result = rewrite_m3u_content(&ctx, session->rewrite_body_buffer,
-                                                 &rewritten, &rewritten_size);
-        free(base_url);
-
-        if (rewrite_result < 0) {
-          logger(LOG_ERROR, "HTTP Proxy: M3U rewrite failed");
-          return -1;
-        }
-
-        /* Build and send response headers with new Content-Length
-         * Passthrough original headers except Content-Length and Transfer-Encoding */
-        char headers[HTTP_PROXY_RESPONSE_BUFFER_SIZE];
-        char *hdr_ptr = headers;
-        size_t hdr_remaining = sizeof(headers);
-        int headers_len = 0;
-
-        if (session->saved_response_headers && session->saved_response_headers_len > 0) {
-          /* Parse and rebuild headers from saved original headers */
-          char *saved_copy = strdup(session->saved_response_headers);
-          if (saved_copy) {
-            char *line = strtok(saved_copy, "\r\n");
-            while (line != NULL) {
-              /* Skip headers that need to be modified */
-              if (strncasecmp(line, "Content-Length:", 15) == 0 ||
-                  strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
-                /* Skip - will add correct Content-Length later */
-              } else {
-                /* Pass through this header */
-                int written = snprintf(hdr_ptr, hdr_remaining, "%s\r\n", line);
-                if (written > 0 && (size_t)written < hdr_remaining) {
-                  hdr_ptr += written;
-                  hdr_remaining -= written;
-                  headers_len += written;
-                }
-              }
-              line = strtok(NULL, "\r\n");
-            }
-            free(saved_copy);
-          }
-
-          /* Add correct Content-Length */
-          int cl_written = snprintf(hdr_ptr, hdr_remaining, "Content-Length: %zu\r\n",
-                                    rewritten_size);
-          if (cl_written > 0 && (size_t)cl_written < hdr_remaining) {
-            hdr_ptr += cl_written;
-            hdr_remaining -= cl_written;
-            headers_len += cl_written;
-          }
-        } else {
-          /* Fallback: build minimal headers */
-          headers_len = snprintf(
-              headers, sizeof(headers),
-              "HTTP/1.1 %d OK\r\n"
-              "Content-Type: %s\r\n"
-              "Content-Length: %zu\r\n"
-              "Connection: close\r\n",
-              session->response_status_code, session->response_content_type,
-              rewritten_size);
-          hdr_ptr = headers + headers_len;
-          hdr_remaining = sizeof(headers) - headers_len;
-        }
-
-        /* Inject Set-Cookie header if needed */
-        if (session->conn && session->conn->should_set_r2h_cookie &&
-            config.r2h_token && config.r2h_token[0] != '\0') {
-          int cookie_written = snprintf(
-              hdr_ptr, hdr_remaining,
-              "Set-Cookie: r2h-token=%s; Path=/; HttpOnly; SameSite=Strict\r\n",
-              config.r2h_token);
-          if (cookie_written > 0 && (size_t)cookie_written < hdr_remaining) {
-            hdr_ptr += cookie_written;
-            hdr_remaining -= cookie_written;
-            headers_len += cookie_written;
-          }
-          session->conn->should_set_r2h_cookie = 0;
-        }
-
-        /* Add final CRLF to end headers */
-        int final_written = snprintf(hdr_ptr, hdr_remaining, "\r\n");
-        if (final_written > 0) {
-          headers_len += final_written;
-        }
-
-        if (connection_queue_output(session->conn, (const uint8_t *)headers,
-                                    headers_len) < 0) {
-          free(rewritten);
-          logger(LOG_ERROR, "HTTP Proxy: Failed to send rewritten headers");
-          return -1;
-        }
-
-        /* Send rewritten body */
-        if (connection_queue_output(session->conn, (const uint8_t *)rewritten,
-                                    rewritten_size) < 0) {
-          free(rewritten);
-          logger(LOG_ERROR, "HTTP Proxy: Failed to send rewritten body");
-          return -1;
-        }
-
-        session->headers_forwarded = 1;
-        if (session->conn) {
-          session->conn->headers_sent = 1;
-        }
-
-        bytes_forwarded = (int)(headers_len + rewritten_size);
-        free(rewritten);
-
-        logger(LOG_DEBUG, "HTTP Proxy: Sent rewritten M3U (%zu bytes body)",
-               rewritten_size);
-      }
-
-      session->state = HTTP_PROXY_STATE_COMPLETE;
-      return bytes_forwarded;
     }
 
     /* Phase 2: Zero-copy streaming - recv directly to buffer pool */
@@ -765,7 +776,7 @@ static int http_proxy_try_receive_response(http_proxy_session_t *session) {
     bytes_forwarded = (int)received;
 
     /* Let connection_queue_zerocopy's internal batching mechanism handle
-     * EPOLLOUT - it uses zerocopy_should_flush() for optimal batching */
+     * POLLER_OUT - it uses zerocopy_should_flush() for optimal batching */
     session->bytes_received += bytes_forwarded;
 
     /* Check if we've received all content */
@@ -844,10 +855,10 @@ static int http_proxy_try_receive_response(http_proxy_session_t *session) {
       /* Check if we've received all content */
       if (session->content_length >= 0 &&
           session->bytes_received >= session->content_length) {
-        /* All body received - trigger rewrite processing on next iteration */
         logger(LOG_DEBUG,
                "HTTP Proxy: All M3U content received with headers (%zd bytes)",
                session->bytes_received);
+        return http_proxy_finalize_rewrite(session);
       }
     } else {
       /* Normal mode: forward immediately */
@@ -1143,7 +1154,7 @@ static int http_proxy_parse_response_headers(http_proxy_session_t *session) {
      * CONN_CLOSING */
     connection_epoll_update_events(
         session->conn->epfd, session->conn->fd,
-        EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+        POLLER_IN | POLLER_OUT | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
   }
 
   /* HEAD responses have no body — go straight to COMPLETE */
@@ -1176,7 +1187,7 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
   }
 
   /* Check for hard socket errors first */
-  if (events & EPOLLERR) {
+  if (events & POLLER_ERR) {
     int sock_error = 0;
     socklen_t error_len = sizeof(sock_error);
     if (getsockopt(session->socket, SOL_SOCKET, SO_ERROR, &sock_error,
@@ -1196,7 +1207,7 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
   }
 
   /* Handle connection completion FIRST - before checking HUP events
-   * When TCP connect completes, we may get EPOLLOUT | EPOLLHUP together
+   * When TCP connect completes, we may get POLLER_OUT | POLLER_HUP together
    * in some edge cases, so we must check connection state first */
   if (session->state == HTTP_PROXY_STATE_CONNECTING) {
     int sock_error = 0;
@@ -1235,7 +1246,7 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
   }
 
   /* Handle writable socket - send pending request */
-  if ((events & EPOLLOUT) &&
+  if ((events & POLLER_OUT) &&
       session->state == HTTP_PROXY_STATE_SENDING_REQUEST) {
     result = http_proxy_try_send_pending(session);
     if (result < 0) {
@@ -1252,14 +1263,12 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
       session->state = HTTP_PROXY_STATE_AWAITING_HEADERS;
       status_update_client_state(session->status_index, CLIENT_STATE_HTTP_AWAITING_HEADERS);
 
-      /* Update epoll to only monitor EPOLLIN */
+      /* Update poller to only monitor POLLER_IN */
       if (session->epoll_fd >= 0) {
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP;
-        ev.data.fd = session->socket;
-        if (epoll_ctl(session->epoll_fd, EPOLL_CTL_MOD, session->socket, &ev) <
+        if (poller_mod(session->epoll_fd, session->socket,
+                       POLLER_IN | POLLER_HUP | POLLER_ERR | POLLER_RDHUP) <
             0) {
-          logger(LOG_ERROR, "HTTP Proxy: Failed to modify epoll events: %s",
+          logger(LOG_ERROR, "HTTP Proxy: Failed to modify poller events: %s",
                  strerror(errno));
           session->state = HTTP_PROXY_STATE_ERROR;
           return -1;
@@ -1268,27 +1277,33 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
     }
   }
 
-  /* Handle readable socket - receive response */
+  /* Handle readable socket - receive response.
+   * Loop until EAGAIN to drain all available data.  This is required for
+   * edge-triggered pollers (epoll EPOLLET / kqueue EV_CLEAR) where the read event fires
+   * only once per data arrival and won't re-trigger while unread data
+   * remains in the socket buffer. */
   int bytes_forwarded = 0;
-  if (events & EPOLLIN) {
-    if (session->state == HTTP_PROXY_STATE_AWAITING_HEADERS ||
-        session->state == HTTP_PROXY_STATE_STREAMING) {
+  if (events & POLLER_IN) {
+    while (session->state == HTTP_PROXY_STATE_AWAITING_HEADERS ||
+           session->state == HTTP_PROXY_STATE_STREAMING) {
       result = http_proxy_try_receive_response(session);
       if (result < 0) {
         logger(LOG_ERROR, "HTTP Proxy: Failed to receive response");
         session->state = HTTP_PROXY_STATE_ERROR;
         return -1;
       }
-      bytes_forwarded = result;
+      if (result == 0)
+        break; /* EAGAIN or need more data - wait for next event */
+      bytes_forwarded += result;
     }
   }
 
   /* Check for connection hangup AFTER processing data.
-   * Only when EPOLLIN was NOT set — if EPOLLIN was set, recv already
+   * Only when POLLER_IN was NOT set — if POLLER_IN was set, recv already
    * handled EOF (returning 0) and set COMPLETE as needed.  Processing
-   * EPOLLHUP together with EPOLLIN would prematurely set COMPLETE
+   * POLLER_HUP together with POLLER_IN would prematurely set COMPLETE
    * before buffered data (e.g. rewrite body) is processed. */
-  if ((events & (EPOLLHUP | EPOLLRDHUP)) && !(events & EPOLLIN)) {
+  if ((events & (POLLER_HUP | POLLER_RDHUP)) && !(events & POLLER_IN)) {
     /* Upstream closed connection */
     if (session->state == HTTP_PROXY_STATE_STREAMING ||
         session->state == HTTP_PROXY_STATE_AWAITING_HEADERS) {
@@ -1306,10 +1321,7 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
   }
 
   /* When transfer is complete, clean up proxy socket and begin draining
-   * the client connection's output queue.
-   * The proxy socket must be removed from epoll immediately because a TCP
-   * socket in EOF state continuously triggers EPOLLIN under level-triggered
-   * epoll, which would cause CPU spin. */
+   * the client connection's output queue. */
   if (session->state == HTTP_PROXY_STATE_COMPLETE) {
     if (session->socket >= 0) {
       worker_cleanup_socket_from_epoll(session->epoll_fd, session->socket);
@@ -1320,7 +1332,7 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
       session->conn->state = CONN_CLOSING;
       connection_epoll_update_events(
           session->conn->epfd, session->conn->fd,
-          EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+          POLLER_IN | POLLER_OUT | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
     }
   }
 
