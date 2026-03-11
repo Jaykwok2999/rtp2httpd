@@ -513,7 +513,7 @@ int worker_run_event_loop(int *listen_sockets, int num_sockets, int notif_fd) {
                                            events[e].events, now);
           if (res < 0) {
             /* Send 200 for r2h-duration request */
-            if (res == -3) {
+            if (res == -2) {
               send_http_headers(c, STATUS_200, "application/json", NULL);
               char response[64];
               snprintf(response, sizeof(response), "{\"duration\": \"%0.3f\"}",
@@ -552,6 +552,14 @@ int worker_run_event_loop(int *listen_sockets, int num_sockets, int notif_fd) {
               c = next;
               continue;
             }
+          }
+        } else if (c->state == CONN_CLOSING &&
+                   c->stream.rtsp.initialized &&
+                   !c->stream.rtsp.cleanup_done) {
+          if (rtsp_session_tick(&c->stream.rtsp, now) < 0) {
+            worker_close_and_free_connection(c);
+            c = next;
+            continue;
           }
         } else if (c->state == CONN_SSE) {
           status_handle_sse_heartbeat(c, now);

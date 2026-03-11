@@ -97,24 +97,16 @@ int stream_handle_fd_event(stream_context_t *ctx, int fd, uint32_t events,
     /* Handle RTSP socket events (handshake and RTP data in PLAYING state) */
     int result = rtsp_handle_socket_event(&ctx->rtsp, events);
     if (result < 0) {
-      /* -2 indicates graceful TEARDOWN completion, not an error */
       if (result == -2) {
-        logger(LOG_DEBUG, "RTSP: Graceful TEARDOWN completed");
-        return -1; /* Signal connection should be closed */
-      }
-      if (result == -3)
-      {
         logger(LOG_DEBUG, "RTSP: found duration: %0.3f", ctx->rtsp.r2h_duration_value);
-        return -3;
+        return -2;
       }
-      /* Real error */
-      logger(LOG_ERROR, "RTSP: Socket event handling failed");
       return -1;
     }
     if (result > 0) {
       ctx->total_bytes_sent += (uint64_t)result;
     }
-    return 0; /* Success - processed data, continue with other events */
+    return 0;
   }
 
   /* Process RTSP RTP socket events (UDP mode) */
@@ -345,8 +337,13 @@ int stream_tick(stream_context_t *ctx, int64_t now) {
   /* FCC session tick (timeout checks) */
   fcc_session_tick(ctx, now);
 
-  /* RTSP session tick (STUN timeout, keepalive) */
-  rtsp_session_tick(&ctx->rtsp, now);
+  /* RTSP session tick (STUN timeout, keepalive, state timeout) */
+  if (rtsp_session_tick(&ctx->rtsp, now) < 0)
+    return -1;
+
+  /* HTTP proxy session tick (state timeout) */
+  if (http_proxy_session_tick(&ctx->http_proxy, now) < 0)
+    return -1;
 
   /* Check snapshot timeout (5 seconds) */
   if (ctx->snapshot.initialized) {
