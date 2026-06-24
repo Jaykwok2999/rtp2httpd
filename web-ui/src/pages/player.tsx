@@ -20,15 +20,14 @@ import { buildCatchupSegments, clampCatchupStartTime, parseM3U } from "../lib/m3
 import {
   getLastChannelId,
   getLastSourceIndex,
-  getMp2SoftDecode,
   getSeamlessSwitch,
   getSidebarVisible,
   saveLastChannelId,
   saveLastSourceIndex,
-  saveMp2SoftDecode,
   saveSeamlessSwitch,
   saveSidebarVisible,
 } from "../lib/player-storage";
+import { buildAppPath } from "../lib/url";
 import type { PlayerSegment } from "../mpegts";
 import { NEAR_LIVE_EDGE_MS } from "../mpegts/player/wall-clock";
 import type { Channel, M3UMetadata } from "../types/player";
@@ -57,7 +56,6 @@ function PlayerPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768);
   const [seamlessSwitch, setSeamlessSwitch] = useState(() => getSeamlessSwitch());
-  const [mp2SoftDecode, setMp2SoftDecode] = useState(() => getMp2SoftDecode());
   const pageContainerRef = useRef<HTMLDivElement>(null);
 
   // Track stream start time - the absolute time position when current stream started
@@ -224,7 +222,7 @@ function PlayerPage() {
       setIsLoading(true);
       setError(null);
 
-      const response = await fetch("/playlist.m3u");
+      const response = await fetch(buildAppPath("/playlist.m3u"));
       if (!response.ok) {
         throw new Error(t("failedToLoadPlaylist"));
       }
@@ -340,11 +338,6 @@ function PlayerPage() {
     saveSeamlessSwitch(enabled);
   }, []);
 
-  const handleMp2SoftDecodeChange = useCallback((enabled: boolean) => {
-    setMp2SoftDecode(enabled);
-    saveMp2SoftDecode(enabled);
-  }, []);
-
   const handleToggleSidebar = useCallback(() => {
     setShowSidebar((prev) => {
       const newState = !prev;
@@ -363,21 +356,10 @@ function PlayerPage() {
           onThemeChange={setTheme}
           seamlessSwitch={seamlessSwitch}
           onSeamlessSwitchChange={handleSeamlessSwitchChange}
-          mp2SoftDecode={mp2SoftDecode}
-          onMp2SoftDecodeChange={handleMp2SoftDecodeChange}
         />
       </div>
     );
-  }, [
-    locale,
-    theme,
-    seamlessSwitch,
-    mp2SoftDecode,
-    setLocale,
-    setTheme,
-    handleSeamlessSwitchChange,
-    handleMp2SoftDecodeChange,
-  ]);
+  }, [locale, theme, seamlessSwitch, setLocale, setTheme, handleSeamlessSwitchChange]);
 
   // Main UI content
   const mainContent = (
@@ -405,7 +387,6 @@ function PlayerPage() {
             onToggleSidebar={handleToggleSidebar}
             onFullscreenToggle={handleFullscreenToggle}
             seamlessSwitch={seamlessSwitch}
-            mp2SoftDecode={mp2SoftDecode}
             activeSourceIndex={activeSourceIndex}
             onSourceChange={handleSourceChange}
             onPlaybackStarted={handlePlaybackStarted}
@@ -537,7 +518,7 @@ function PlayerPage() {
               <div className="min-w-0 border-t border-border/70 bg-muted/30 p-6 md:border-t-0 md:border-l md:p-8">
                 <div className="text-sm font-semibold text-foreground">{t("playlistEndpoint")}</div>
                 <div className="mt-3 rounded-lg border border-border/70 bg-background px-3 py-2 font-mono text-sm text-foreground">
-                  /playlist.m3u
+                  {buildAppPath("/playlist.m3u")}
                 </div>
                 <div className="mt-6 text-sm font-semibold text-foreground">{t("technicalDetails")}</div>
                 <p className="mt-2 break-words text-sm leading-6 text-muted-foreground">{error}</p>

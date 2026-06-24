@@ -16,15 +16,17 @@ rtp2httpd [选项]
 
 ### 网络配置
 
-- `-l, --listen [地址:]端口` - 绑定监听地址和端口 (默认: \*:5140)
+- `-l, --listen [地址:]端口|/path/to/rtp2httpd.sock` - 绑定 TCP 监听地址/端口，或监听 Unix domain socket (默认: \*:5140)
 - `-m, --maxclients <数量>` - 最大并发客户端数 (默认: 5)
 - `-w, --workers <数量>` - 工作进程数 (默认: 1)
 
-`--listen` 可以重复指定，用于同时监听多个地址或端口：
+`--listen` 可以重复指定，用于同时监听多个 TCP 地址/端口或 Unix socket：
 
 ```bash
-rtp2httpd --listen 5140 --listen 192.168.1.1:8081 --listen '[::1]:5140'
+rtp2httpd --listen 5140 --listen 192.168.1.1:8081 --listen '[::1]:5140' --listen /var/run/rtp2httpd.sock
 ```
+
+Unix socket 监听路径必须是绝对路径，且路径中不能包含空白字符。启动时如果同路径已存在 socket 文件，rtp2httpd 会先探测该 socket 是否仍在使用：如果已有进程正在监听该路径，则拒绝启动；只有确认是残留 socket 文件时才会自动清理。如果同路径是普通文件、目录或符号链接，则会拒绝启动以避免误删数据。启用任意 Unix socket 监听时，`zerocopy-on-send` 会被全局关闭。
 
 #### 上游网络接口配置
 
@@ -79,6 +81,7 @@ rtp2httpd --listen 5140 --listen 192.168.1.1:8081 --listen '[::1]:5140'
   - 设为 `*` 允许所有来源，或指定具体域名（如 `https://example.com`）
 - `-s, --status-page-path <路径>` - 状态页面与 API 根路径 (默认: /status)
 - `-p, --player-page-path <路径>` - 内置播放器页面路径 (默认: /player)
+- `--app-path-prefix <路径>` - 所有 HTTP 资源的公开访问前缀 (默认: 无)
 
 ### 兼容性
 
@@ -141,11 +144,16 @@ xff = no
 # http://server:5140/player?r2h-token=your-secret-token
 r2h-token = your-secret-token-here
 
-# 状态页路径（默认: /status）
+# 状态页应用内路径（默认: /status；配置 app-path-prefix 时会挂载在该前缀下）
 status-page-path = /status
 
-# 播放器页路径（默认: /player）
+# 播放器页应用内路径（默认: /player；配置 app-path-prefix 时会挂载在该前缀下）
 player-page-path = /player
+
+# 所有 HTTP 资源的公开访问前缀（默认: 无）
+# 设置后，状态页、播放器、静态资源、playlist.m3u、epg.xml 和流媒体 URL
+# 都会在此前缀下提供，例如 /app/rtp2httpd/player。
+app-path-prefix = /app/rtp2httpd
 
 # 上游网络接口配置 (可选)
 #
@@ -249,6 +257,9 @@ ffmpeg-args = -hwaccel none
 # 监听 IPv6 地址（可省略方括号）
 2001:db8::1 5140
 
+# 监听 Unix domain socket（路径必须是绝对路径）
+/var/run/rtp2httpd.sock
+
 # 支持多个监听地址
 
 # [services] 内可以直接编写以 #EXTM3U 开头的 m3u 节目清单
@@ -260,3 +271,46 @@ rtp://239.253.64.120:5140
 #EXTINF:-1 tvg-id="CCTV2" tvg-name="CCTV2" group-title="央视",CCTV-2
 rtp://239.253.64.121:5140
 ```
+
+## 运行时配置管理
+
+rtp2httpd 支持配置热重载：修改配置文件后，通过发送信号或状态页面触发重载，即可应用变更，无需重启整个进程。rtp2httpd 采用 supervisor + worker 多进程架构，信号应发送给 **supervisor 进程**（即主 `rtp2httpd` 进程，而非 worker 子进程）。
+
+### 信号说明
+
+| 信号 | 作用 |
+| --- | --- |
+| `SIGHUP` | 热重载配置：从配置文件重新读取并应用 |
+| `SIGUSR1` | 重启所有工作进程 |
+
+**示例**（将 `12345` 替换为 supervisor 进程的 PID）：
+
+```bash
+# 热重载配置
+kill -HUP 12345
+
+# 重启所有工作进程
+kill -USR1 12345
+```
+
+### SIGHUP 热重载行为
+
+- 从配置文件（默认 `/etc/rtp2httpd.conf`，或通过 `--config` 指定的路径）重新读取配置
+- 若 `[bind]` 监听地址发生变化，supervisor 会向所有工作进程发送 `SIGTERM` 并重新拉起，以应用新的监听地址
+- 若 `workers` 数量发生变化，supervisor 会自动增减工作进程
+- 其他配置变更会转发 `SIGHUP` 给各工作进程，由工作进程在运行时应用
+- 若配置文件解析失败，保留旧配置，不会中断现有连接
+
+> [!NOTE]
+> 使用 `--noconfig` 启动时，没有配置文件可供重载；此时 `SIGHUP` 仅触发 M3U/EPG 的重新加载。
+
+### SIGUSR1 重启工作进程
+
+向 supervisor 发送 `SIGUSR1` 后，所有工作进程会被终止并由 supervisor 自动重新拉起。适用于需要刷新工作进程状态、但不修改配置文件的场景。进行中的客户端连接会被中断。
+
+### 通过状态页面操作
+
+[状态页面](../guide/url-formats.md#状态页面) 提供了等效的管理功能，无需手动查找 PID：
+
+- **重载配置**：对应 `SIGHUP`（API：`POST <status-page-path>/api/reload-config`）
+- **重启工作进程**：对应 `SIGUSR1`（API：`POST <status-page-path>/api/restart-workers`）

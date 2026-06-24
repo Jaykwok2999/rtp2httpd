@@ -16,15 +16,17 @@ rtp2httpd [options]
 
 ### Network Configuration
 
-- `-l, --listen [address:]port` - Bind address and port (default: \*:5140)
+- `-l, --listen [address:]port|/path/to/rtp2httpd.sock` - Bind a TCP listen address/port, or listen on a Unix domain socket (default: \*:5140)
 - `-m, --maxclients <number>` - Maximum concurrent clients (default: 5)
 - `-w, --workers <number>` - Number of worker processes (default: 1)
 
-`--listen` can be specified multiple times to listen on multiple addresses or ports:
+`--listen` can be specified multiple times to listen on multiple TCP addresses/ports or Unix sockets:
 
 ```bash
-rtp2httpd --listen 5140 --listen 192.168.1.1:8081 --listen '[::1]:5140'
+rtp2httpd --listen 5140 --listen 192.168.1.1:8081 --listen '[::1]:5140' --listen /var/run/rtp2httpd.sock
 ```
+
+Unix socket listen paths must be absolute and must not contain whitespace. At startup, if the same path already contains a socket file, rtp2httpd first probes whether the socket is still in use: if another process is listening on that path, startup is rejected; only confirmed stale socket files are removed automatically. If the path is a regular file, directory, or symbolic link, startup is rejected to avoid deleting user data. When any Unix socket listener is enabled, `zerocopy-on-send` is disabled globally.
 
 #### Upstream Network Interface Configuration
 
@@ -79,6 +81,7 @@ rtp2httpd --listen 5140 --listen 192.168.1.1:8081 --listen '[::1]:5140'
   - Set to `*` to allow all origins, or specify a domain (e.g., `https://example.com`)
 - `-s, --status-page-path <path>` - Status page and API root path (default: /status)
 - `-p, --player-page-path <path>` - Built-in player page path (default: /player)
+- `--app-path-prefix <path>` - Public access prefix for all HTTP resources (default: none)
 
 ### Compatibility
 
@@ -141,11 +144,17 @@ xff = no
 # http://server:5140/player?r2h-token=your-secret-token
 r2h-token = your-secret-token-here
 
-# Status page path (default: /status)
+# Status page app path (default: /status; mounted under app-path-prefix when configured)
 status-page-path = /status
 
-# Player page path (default: /player)
+# Player page app path (default: /player; mounted under app-path-prefix when configured)
 player-page-path = /player
+
+# Public access prefix for all HTTP resources (default: none)
+# After this is set, the status page, player, static assets,
+# playlist.m3u, epg.xml, and stream URLs are all served under this
+# prefix, for example /app/rtp2httpd/player.
+app-path-prefix = /app/rtp2httpd
 
 # Upstream network interface configuration (optional)
 #
@@ -249,6 +258,9 @@ ffmpeg-args = -hwaccel none
 # Listen on an IPv6 address (brackets optional)
 2001:db8::1 5140
 
+# Listen on a Unix domain socket (path must be absolute)
+/var/run/rtp2httpd.sock
+
 # Multiple listen addresses are supported
 
 # The [services] section can contain M3U playlists starting with #EXTM3U
@@ -260,3 +272,46 @@ rtp://239.253.64.120:5140
 #EXTINF:-1 tvg-id="CCTV2" tvg-name="CCTV2" group-title="CCTV",CCTV-2
 rtp://239.253.64.121:5140
 ```
+
+## Runtime Configuration Management
+
+rtp2httpd supports configuration hot reload: after editing the configuration file, trigger a reload via signal or the status page to apply changes without restarting the entire process. rtp2httpd uses a supervisor + worker multi-process architecture. Signals must be sent to the **supervisor process** (the main `rtp2httpd` process, not worker child processes).
+
+### Signal Reference
+
+| Signal | Action |
+| --- | --- |
+| `SIGHUP` | Hot reload configuration: re-read and apply settings from the config file |
+| `SIGUSR1` | Restart all worker processes |
+
+**Examples** (replace `12345` with the supervisor process PID):
+
+```bash
+# Hot reload configuration
+kill -HUP 12345
+
+# Restart all workers
+kill -USR1 12345
+```
+
+### SIGHUP Hot Reload Behavior
+
+- Re-reads configuration from the config file (default `/etc/rtp2httpd.conf`, or the path specified via `--config`)
+- If `[bind]` listen addresses change, the supervisor sends `SIGTERM` to all workers and respawns them to apply the new listen addresses
+- If the `workers` count changes, the supervisor automatically adds or removes worker processes
+- For other configuration changes, the supervisor forwards `SIGHUP` to each worker, which applies them at runtime
+- If the config file fails to parse, the old configuration is kept and existing connections are not interrupted
+
+> [!NOTE]
+> When started with `--noconfig`, there is no config file to reload. In that case, `SIGHUP` only triggers M3U/EPG reload.
+
+### SIGUSR1 Worker Restart
+
+Sending `SIGUSR1` to the supervisor terminates all worker processes, which the supervisor then automatically respawns. Use this when you need to refresh worker state without modifying the configuration file. Active client connections will be interrupted.
+
+### Via the Status Page
+
+The [status page](/en/guide/url-formats#status-page) provides equivalent management functions without manually looking up the PID:
+
+- **Reload Config**: equivalent to `SIGHUP` (API: `POST <status-page-path>/api/reload-config`)
+- **Restart Workers**: equivalent to `SIGUSR1` (API: `POST <status-page-path>/api/restart-workers`)

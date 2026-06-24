@@ -4,6 +4,8 @@ rtp2httpd supports multiple streaming protocols, distinguished by different URL 
 
 Basic format: `http://server:port/path[?param1=value1][&param2=value2][&param3=value3]`
 
+If `app-path-prefix` is configured, add that prefix to every path. For example, with `app-path-prefix = /app/rtp2httpd`, `/rtp/...`, `/status`, `/player`, and `/playlist.m3u` become `/app/rtp2httpd/rtp/...`, `/app/rtp2httpd/status`, `/app/rtp2httpd/player`, and `/app/rtp2httpd/playlist.m3u`.
+
 When `r2h-token` (HTTP request authentication token) is configured, all URLs must include the `r2h-token=<your token>` parameter to be accessible.
 
 > [!TIP]
@@ -222,7 +224,17 @@ Access the web status page to view:
 - Real-time client connection statistics
 - IP, status, bandwidth usage, and data transferred for each connection
 - System log viewer
-- Remote management functions (force disconnect, etc.)
+- Remote management functions (force disconnect, adjust log level, etc.)
+- Service control: reload configuration, restart worker processes
+
+**Service control** (equivalent to sending Unix signals to the supervisor):
+
+| Action | Equivalent Signal | API |
+| --- | --- | --- |
+| Reload config | `SIGHUP` | `POST /status/api/reload-config` |
+| Restart workers | `SIGUSR1` | `POST /status/api/restart-workers` |
+
+Replace `/status` with your actual `status-page-path` value. See [Configuration Reference — Runtime Configuration Management](/en/reference/configuration#runtime-configuration-management) for details.
 
 The status page path can be customized via the `status-page-path` configuration option. Setting it to `/` enables direct access without any path.
 
