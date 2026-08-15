@@ -3,9 +3,54 @@
 from __future__ import annotations
 
 import http.client
+import json
 import re
 import socket
 import time
+
+
+def get_status_payload(host: str, port: int, timeout: float = 3.0, status_path: str = "/status") -> dict | None:
+    """Return the first JSON payload from the status SSE endpoint."""
+    sock = socket.create_connection((host, port), timeout=timeout)
+    data = b""
+    try:
+        request = "GET {}/sse HTTP/1.0\r\nHost: {}\r\n\r\n".format(status_path.rstrip("/"), host)
+        sock.sendall(request.encode())
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sock.settimeout(min(1.0, max(0.1, deadline - time.monotonic())))
+            try:
+                chunk = sock.recv(65536)
+            except TimeoutError:
+                continue
+            if not chunk:
+                break
+            data += chunk
+            for line in data.decode(errors="replace").splitlines():
+                if line.startswith("data: {"):
+                    return json.loads(line[len("data: ") :])
+    finally:
+        sock.close()
+    return None
+
+
+def wait_for_status_payload(
+    host: str, port: int, predicate, timeout: float = 6.0, status_path: str = "/status"
+) -> dict:
+    """Poll status SSE until predicate(payload) succeeds."""
+    deadline = time.monotonic() + timeout
+    last_payload = None
+    while time.monotonic() < deadline:
+        try:
+            last_payload = get_status_payload(
+                host, port, timeout=min(2.0, max(0.2, deadline - time.monotonic())), status_path=status_path
+            )
+        except OSError, TimeoutError, json.JSONDecodeError:
+            last_payload = None
+        if last_payload is not None and predicate(last_payload):
+            return last_payload
+        time.sleep(0.05)
+    raise AssertionError(f"Status predicate not satisfied; last payload: {last_payload!r}")
 
 
 def http_get(
@@ -110,6 +155,37 @@ def _parse_raw_http_response(data: bytes, lower_header_names: bool = False) -> t
     return status_code, hdrs, body
 
 
+def raw_http_request(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    timeout: float = 5.0,
+) -> tuple[int, dict, bytes]:
+    """Send a request over a bare socket and return the response verbatim.
+
+    Unlike ``http_request``, this does not use ``http.client``, which silently
+    treats HEAD responses as bodiless.  Use it to assert that a HEAD response
+    really carries no content (RFC 9110 9.3.2).
+    """
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        sock.sendall((f"{method} {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").encode())
+        data = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        sock.close()
+
+    return _parse_raw_http_response(data, lower_header_names=True)
+
+
 def unix_http_request(
     socket_path: str,
     method: str,
@@ -123,12 +199,12 @@ def unix_http_request(
     sock.settimeout(timeout)
     try:
         sock.connect(socket_path)
-        req_lines = ["%s %s HTTP/1.0" % (method, path), "Host: localhost"]
+        req_lines = [f"{method} {path} HTTP/1.0", "Host: localhost"]
         payload = body or b""
         for k, v in (headers or {}).items():
-            req_lines.append("%s: %s" % (k, v))
+            req_lines.append(f"{k}: {v}")
         if payload:
-            req_lines.append("Content-Length: %d" % len(payload))
+            req_lines.append(f"Content-Length: {len(payload)}")
         req_lines.append("")
         req_lines.append("")
         sock.sendall("\r\n".join(req_lines).encode() + payload)
@@ -137,7 +213,7 @@ def unix_http_request(
         while True:
             try:
                 chunk = sock.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 break
             if not chunk:
                 break
@@ -165,9 +241,9 @@ def extract_catchup_source(playlist_text, channel_name):
     for line in playlist_text.splitlines():
         if channel_name in line and "catchup-source=" in line:
             match = re.search(r'catchup-source="([^"]+)"', line)
-            assert match, "Expected catchup-source in line: %s" % line
+            assert match, f"Expected catchup-source in line: {line}"
             return line, match.group(1)
-    raise AssertionError("Expected catchup-source line for channel: %s" % channel_name)
+    raise AssertionError(f"Expected catchup-source line for channel: {channel_name}")
 
 
 def stream_get(
@@ -191,13 +267,13 @@ def stream_get(
     """
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
-    except OSError, socket.timeout:
+    except TimeoutError, OSError:
         return 0, {}, b""
     try:
-        host_hdr = "[%s]" % host if ":" in host and not host.startswith("[") else host
-        req_lines = ["GET %s HTTP/1.0" % path, "Host: %s" % host_hdr]
+        host_hdr = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        req_lines = [f"GET {path} HTTP/1.0", f"Host: {host_hdr}"]
         for k, v in (headers or {}).items():
-            req_lines.append("%s: %s" % (k, v))
+            req_lines.append(f"{k}: {v}")
         req_lines.append("")
         req_lines.append("")
         sock.sendall("\r\n".join(req_lines).encode())
@@ -213,14 +289,14 @@ def stream_get(
             sock.settimeout(min(remaining, 1.0))
             try:
                 chunk = sock.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 continue  # keep trying until deadline
             if not chunk:
                 break
             data += chunk
 
         return _parse_raw_http_response(data, lower_header_names=True)
-    except socket.timeout, OSError:
+    except TimeoutError, OSError:
         return 0, {}, b""
     finally:
         sock.close()

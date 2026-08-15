@@ -922,6 +922,20 @@ int connection_route_and_start(connection_t *c) {
     c->should_set_r2h_cookie = (source == TOKEN_SOURCE_QUERY);
   }
 
+  const char *status_manifest_route = "status.webmanifest";
+  size_t status_manifest_route_len = strlen(status_manifest_route);
+  if (status_manifest_route_len == path_len && strncmp(service_path, status_manifest_route, path_len) == 0) {
+    handle_web_app_manifest(c, false);
+    return 0;
+  }
+
+  const char *player_manifest_route = "player.webmanifest";
+  size_t player_manifest_route_len = strlen(player_manifest_route);
+  if (player_manifest_route_len == path_len && strncmp(service_path, player_manifest_route, path_len) == 0) {
+    handle_web_app_manifest(c, true);
+    return 0;
+  }
+
   const char *status_route = config.status_page_route ? config.status_page_route : "status";
   size_t status_route_len = strlen(status_route);
   char status_sse_route[HTTP_URL_BUFFER_SIZE];
@@ -1059,25 +1073,33 @@ int connection_route_and_start(connection_t *c) {
     return 0;
   }
 
-  /* Handle HEAD requests for RTP/RTSP streams - return success without
-   * connecting upstream.  HTTP services forward HEAD to the upstream server
-   * so the real Content-Type (e.g. application/vnd.apple.mpegurl for HLS)
-   * is returned to the client. */
-  if (strcasecmp(c->http_req.method, "HEAD") == 0 && service->service_type != SERVICE_HTTP) {
-    logger(LOG_INFO, "HEAD request detected, returning success without upstream connection");
-    send_http_headers(c, STATUS_200, "video/mp2t", NULL);
-    connection_queue_output_and_flush(c, NULL, 0);
-    service_free(service);
-    return 0;
-  }
-
   if (c->http_req.user_agent[0]) {
     service->user_agent = strdup(c->http_req.user_agent);
   }
 
-  /* Capacity check */
-  if (status_shared && status_shared->total_clients >= config.maxclients) {
-    http_send_503(c);
+  /* HTTP services forward HEAD upstream unchanged. Multicast HEAD requests
+   * return only static metadata. RTSP HEAD performs an asynchronous
+   * OPTIONS/DESCRIBE probe without opening media resources. */
+  if (strcasecmp(c->http_req.method, "HEAD") == 0 && service->service_type != SERVICE_HTTP) {
+    if (service->service_type == SERVICE_RTSP) {
+      logger(LOG_INFO, "RTSP HEAD request detected, starting metadata probe");
+      if (stream_context_init_rtsp_metadata_probe(&c->stream, c, service, c->epfd) == 0) {
+        c->streaming = 1;
+        c->service = service;
+        c->state = CONN_STREAMING;
+        return 0;
+      }
+
+      stream_context_cleanup(&c->stream);
+      http_send_503(c);
+      service_free(service);
+      return 0;
+    }
+
+    logger(LOG_INFO, "Multicast HEAD request detected, returning static metadata");
+    stream_metadata_init(&c->stream.metadata, service);
+    stream_send_http_headers(c, "video/mp2t", NULL);
+    connection_queue_output_and_flush(c, NULL, 0);
     service_free(service);
     return 0;
   }
@@ -1155,7 +1177,9 @@ int connection_route_and_start(connection_t *c) {
 
     c->status_index = status_register_client(client_addr_str, display_url);
     if (c->status_index < 0) {
-      logger(LOG_ERROR, "Failed to register streaming client in status tracking");
+      http_send_503(c);
+      service_free(service);
+      return 0;
     } else {
       access_log_write_connection(c, service, c->status_index);
     }

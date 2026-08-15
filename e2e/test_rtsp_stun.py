@@ -15,11 +15,11 @@ localhost (no real NAT).  The SETUP Transport header still contains UDP
 import time
 
 import pytest
-
 from helpers import (
     MockRTSPServer,
     R2HProcess,
     find_free_port,
+    http_request,
     stream_get,
 )
 from helpers.mock_stun import MockSTUNServer
@@ -27,6 +27,38 @@ from helpers.mock_stun import MockSTUNServer
 pytestmark = pytest.mark.rtsp
 
 _STREAM_TIMEOUT = 20.0
+
+
+class TestHeadProbeSkipsSTUN:
+    def test_head_does_not_allocate_media_transport(self, r2h_binary):
+        stun = MockSTUNServer(mapped_port=50000)
+        rtsp = MockRTSPServer()
+        stun.start()
+        rtsp.start()
+        r2h_port = find_free_port()
+        r2h = R2HProcess(
+            r2h_binary,
+            r2h_port,
+            extra_args=["-v", "4", "-m", "100", "-N", f"127.0.0.1:{stun.port}"],
+        )
+        r2h.start()
+        try:
+            status, _, body = http_request(
+                "127.0.0.1",
+                r2h_port,
+                "HEAD",
+                f"/rtsp/127.0.0.1:{rtsp.port}/stream",
+                timeout=8.0,
+            )
+            assert status == 200
+            assert body == b""
+            assert rtsp.requests_received == ["OPTIONS", "DESCRIBE"]
+            time.sleep(0.1)
+            assert stun.requests_received == 0
+        finally:
+            r2h.stop()
+            rtsp.stop()
+            stun.stop()
 
 
 class TestSTUNMappedPort:
@@ -43,14 +75,14 @@ class TestSTUNMappedPort:
         r2h = R2HProcess(
             r2h_binary,
             r2h_port,
-            extra_args=["-v", "4", "-m", "100", "-N", "127.0.0.1:%d" % stun.port],
+            extra_args=["-v", "4", "-m", "100", "-N", f"127.0.0.1:{stun.port}"],
         )
         r2h.start()
         try:
             status, _, body = stream_get(
                 "127.0.0.1",
                 r2h_port,
-                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                f"/rtsp/127.0.0.1:{rtsp.port}/stream",
                 read_bytes=4096,
                 timeout=_STREAM_TIMEOUT,
             )
@@ -58,14 +90,14 @@ class TestSTUNMappedPort:
             assert len(body) > 0
 
             # STUN server should have received at least one Binding Request
-            assert stun.requests_received >= 1, "Expected STUN Binding Request, got %d" % stun.requests_received
+            assert stun.requests_received >= 1, f"Expected STUN Binding Request, got {stun.requests_received}"
 
             # Verify the SETUP Transport header uses the mapped port
             setup_reqs = [r for r in rtsp.requests_detailed if r["method"] == "SETUP"]
             assert len(setup_reqs) >= 1, "No SETUP request received"
             transport = setup_reqs[0]["headers"].get("Transport", "")
-            assert "client_port=%d-%d" % (mapped_port, mapped_port + 1) in transport, (
-                "Expected mapped port %d in Transport, got: %s" % (mapped_port, transport)
+            assert f"client_port={mapped_port}-{(mapped_port + 1)}" in transport, (
+                f"Expected mapped port {mapped_port} in Transport, got: {transport}"
             )
         finally:
             r2h.stop()
@@ -82,20 +114,20 @@ class TestSTUNMappedPort:
         r2h = R2HProcess(
             r2h_binary,
             r2h_port,
-            extra_args=["-v", "4", "-m", "100", "-N", "127.0.0.1:%d" % stun.port],
+            extra_args=["-v", "4", "-m", "100", "-N", f"127.0.0.1:{stun.port}"],
         )
         r2h.start()
         try:
             status, _, body = stream_get(
                 "127.0.0.1",
                 r2h_port,
-                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                f"/rtsp/127.0.0.1:{rtsp.port}/stream",
                 read_bytes=4096,
                 timeout=_STREAM_TIMEOUT,
             )
             assert status == 200
             assert len(body) >= 188
-            assert body[0] == 0x47, "Expected TS sync byte 0x47, got 0x%02x" % body[0]
+            assert body[0] == 0x47, f"Expected TS sync byte 0x47, got 0x{body[0]:02x}"
         finally:
             r2h.stop()
             rtsp.stop()
@@ -116,14 +148,14 @@ class TestSTUNTimeout:
         r2h = R2HProcess(
             r2h_binary,
             r2h_port,
-            extra_args=["-v", "4", "-m", "100", "-N", "127.0.0.1:%d" % stun.port],
+            extra_args=["-v", "4", "-m", "100", "-N", f"127.0.0.1:{stun.port}"],
         )
         r2h.start()
         try:
             status, _, body = stream_get(
                 "127.0.0.1",
                 r2h_port,
-                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                f"/rtsp/127.0.0.1:{rtsp.port}/stream",
                 read_bytes=4096,
                 timeout=_STREAM_TIMEOUT,
             )
@@ -155,14 +187,14 @@ class TestSTUNTimeout:
         r2h = R2HProcess(
             r2h_binary,
             r2h_port,
-            extra_args=["-v", "4", "-m", "100", "-N", "127.0.0.1:%d" % stun.port],
+            extra_args=["-v", "4", "-m", "100", "-N", f"127.0.0.1:{stun.port}"],
         )
         r2h.start()
         try:
             stream_get(
                 "127.0.0.1",
                 r2h_port,
-                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                f"/rtsp/127.0.0.1:{rtsp.port}/stream",
                 read_bytes=4096,
                 timeout=_STREAM_TIMEOUT,
             )
@@ -171,7 +203,7 @@ class TestSTUNTimeout:
 
             # Should have received initial + up to 2 retries = 3
             assert stun.requests_received >= 2, (
-                "Expected at least 2 STUN requests (initial + retry), got %d" % stun.requests_received
+                f"Expected at least 2 STUN requests (initial + retry), got {stun.requests_received}"
             )
         finally:
             r2h.stop()

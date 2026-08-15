@@ -1,5 +1,5 @@
 import { Activity, Gauge, Layers, Users } from "lucide-react";
-import { StrictMode, useCallback, useMemo, useState } from "react";
+import { StrictMode, startTransition, useCallback, useDeferredValue, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ConnectionsSection } from "../components/status/connections-section";
 import { LogsSection } from "../components/status/logs-section";
@@ -13,12 +13,11 @@ import { useSse } from "../hooks/use-sse";
 import { useStatusApi } from "../hooks/use-status-api";
 import { useStatusTranslation } from "../hooks/use-status-translation";
 import { useTheme } from "../hooks/use-theme";
-import type { TranslationKey } from "../i18n/status";
 import { formatBandwidth, formatBytes, formatDuration } from "../lib/format";
 import type { Locale } from "../lib/locale";
 import { mergeClients } from "../lib/status";
 import type { ClientRow, LogEntry, StatusPayload } from "../types";
-import type { ConnectionState, ThemeMode } from "../types/ui";
+import type { ConnectionState } from "../types/ui";
 
 const LOG_LEVELS: Array<{ value: number; label: string }> = [
   { value: 0, label: "FATAL" },
@@ -28,27 +27,17 @@ const LOG_LEVELS: Array<{ value: number; label: string }> = [
   { value: 4, label: "DEBUG" },
 ];
 
-const localeOptions: Array<{ value: Locale; label: string }> = [
-  { value: "en", label: "English" },
-  { value: "zh-Hans", label: "简体中文" },
-  { value: "zh-Hant", label: "繁體中文" },
-];
-
-const THEME_OPTIONS: ThemeMode[] = ["auto", "light", "dark"];
-const THEME_LABELS: Record<ThemeMode, TranslationKey> = {
-  auto: "themeAuto",
-  light: "themeLight",
-  dark: "themeDark",
-};
+const LOG_LEVEL_OPTIONS = LOG_LEVELS.map((level) => ({ value: String(level.value), label: level.label }));
+const EMPTY_WORKERS: NonNullable<StatusPayload["workers"]> = [];
 
 const MAX_LOG_ENTRIES = 500;
 
 function StatusPage() {
-  const { locale, setLocale } = useLocale("status-locale");
+  const { locale, setLocale } = useLocale("rtp2httpd-status-locale");
   const t = useStatusTranslation(locale);
 
-  const { theme, setTheme } = useTheme("status-theme");
-  const { bandwidthUnit, setBandwidthUnit } = useBandwidthUnit("status-bandwidth-unit");
+  const { theme, setTheme } = useTheme("rtp2httpd-status-theme");
+  const { bandwidthUnit, setBandwidthUnit } = useBandwidthUnit("rtp2httpd-status-bandwidth-unit");
   const { disconnectClient, setLogLevel, clearLogs, reloadConfig, restartWorkers } = useStatusApi();
 
   const [connectionState, setConnectionState] = useState<ConnectionState>("reconnecting");
@@ -88,6 +77,24 @@ function StatusPage() {
     });
     return showDisconnected ? values : values.filter((client) => !client.isDisconnected);
   }, [clientsMap, showDisconnected]);
+  const deferredClients = useDeferredValue(clients);
+  const deferredLogs = useDeferredValue(logs);
+  const workers = payload?.workers ?? EMPTY_WORKERS;
+  const deferredWorkers = useDeferredValue(workers);
+
+  const handleLocaleChange = useCallback(
+    (nextLocale: Locale) => {
+      startTransition(() => setLocale(nextLocale));
+    },
+    [setLocale],
+  );
+
+  const handleThemeChange = useCallback(
+    (nextTheme: Parameters<typeof setTheme>[0]) => {
+      startTransition(() => setTheme(nextTheme));
+    },
+    [setTheme],
+  );
 
   const handleDisconnect = useCallback(
     async (clientId: string) => {
@@ -164,10 +171,10 @@ function StatusPage() {
 
   const statusAccent =
     connectionState === "connected"
-      ? "text-emerald-500"
+      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 shadow-[0_0_24px_-12px_rgba(16,185,129,0.85)] dark:text-emerald-300"
       : connectionState === "reconnecting"
-        ? "text-amber-500"
-        : "text-destructive";
+        ? "border-amber-500/25 bg-amber-500/10 text-amber-700 shadow-[0_0_24px_-12px_rgba(245,158,11,0.8)] dark:text-amber-300"
+        : "border-rose-500/25 bg-rose-500/10 text-rose-700 shadow-[0_0_24px_-12px_rgba(244,63,94,0.8)] dark:text-rose-300";
 
   const stats = useMemo(
     () => [
@@ -202,8 +209,8 @@ function StatusPage() {
   return (
     <>
       <title>{t("title")}</title>
-      <div className="min-h-screen bg-background pb-12">
-        <div className="mx-auto flex w-full flex-col gap-4 sm:gap-6 p-3 sm:p-6">
+      <div className="relative isolate min-h-screen overflow-x-hidden bg-background bg-[radial-gradient(circle_at_8%_-8%,hsl(252_92%_72%/0.2),transparent_34rem),radial-gradient(circle_at_96%_2%,hsl(190_96%_60%/0.14),transparent_30rem),linear-gradient(180deg,hsl(226_56%_98%/0.68),hsl(var(--background))_28rem)] bg-fixed pb-12 dark:bg-[radial-gradient(circle_at_8%_-10%,hsl(252_92%_66%/0.18),transparent_36rem),radial-gradient(circle_at_94%_0%,hsl(190_96%_52%/0.11),transparent_32rem),linear-gradient(180deg,hsl(231_48%_9%/0.8),hsl(var(--background))_30rem)] max-md:bg-scroll">
+        <div className="relative z-10 mx-auto flex w-full flex-col gap-4 p-3 sm:gap-6 sm:p-6">
           <StatusHeader
             statusAccent={statusAccent}
             statusLabel={statusLabel}
@@ -211,12 +218,9 @@ function StatusPage() {
             uptime={uptime}
             version={payload?.version ?? "--"}
             locale={locale}
-            onLocaleChange={setLocale}
-            localeOptions={localeOptions}
+            onLocaleChange={handleLocaleChange}
             theme={theme}
-            onThemeChange={setTheme}
-            themeOptions={THEME_OPTIONS}
-            themeLabels={THEME_LABELS}
+            onThemeChange={handleThemeChange}
             bandwidthUnit={bandwidthUnit}
             onBandwidthUnitChange={setBandwidthUnit}
           />
@@ -224,7 +228,7 @@ function StatusPage() {
           <SummaryStats stats={stats} />
 
           <ConnectionsSection
-            clients={clients}
+            clients={deferredClients}
             locale={locale}
             showDisconnected={showDisconnected}
             onShowDisconnectedChange={setShowDisconnected}
@@ -233,14 +237,11 @@ function StatusPage() {
             bandwidthUnit={bandwidthUnit}
           />
 
-          <WorkersSection workers={payload?.workers ?? []} locale={locale} bandwidthUnit={bandwidthUnit} />
+          <WorkersSection workers={deferredWorkers} locale={locale} bandwidthUnit={bandwidthUnit} />
 
           <LogsSection
-            logs={logs}
-            options={LOG_LEVELS.map((level) => ({
-              value: String(level.value),
-              label: level.label,
-            }))}
+            logs={deferredLogs}
+            options={LOG_LEVEL_OPTIONS}
             logLevelValue={logLevelValue}
             onLogLevelChange={handleLogLevelChange}
             disabled={!logLevelValue}

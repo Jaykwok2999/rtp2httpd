@@ -33,6 +33,7 @@ endif()
 set(COMMON_SOURCES
   src/rtp2httpd.c
   src/supervisor.c
+  src/pid_file.c
   src/configuration.c
   src/access_log.c
   src/http.c
@@ -49,6 +50,7 @@ set(COMMON_SOURCES
   src/fcc_huawei.c
   src/stream.c
   src/rtsp.c
+  src/http_chunked_decoder.c
   src/http_proxy.c
   src/http_proxy_rewrite.c
   src/stun.c
@@ -149,7 +151,8 @@ endif()
 
 # ── Libraries ───────────────────────────────────────────────────────
 find_package(Threads REQUIRED)
-target_link_libraries(rtp2httpd PRIVATE Threads::Threads)
+# Math functions require libm on some Unix platforms; macOS maps it to libSystem.
+target_link_libraries(rtp2httpd PRIVATE Threads::Threads m)
 
 if(PLATFORM_LINUX)
   # rt library for clock_gettime (not needed on macOS)

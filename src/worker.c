@@ -225,6 +225,8 @@ static void sighup_handler(int signum) {
   reload_flag = 1;
 }
 
+void worker_install_sighup_handler(void) { signal(SIGHUP, &sighup_handler); }
+
 int worker_run_event_loop(int *listen_sockets, int num_sockets, int notif_fd) {
   int i;
   struct sockaddr_storage client;
@@ -259,7 +261,7 @@ int worker_run_event_loop(int *listen_sockets, int num_sockets, int notif_fd) {
   /* Register signal handlers */
   signal(SIGTERM, &term_handler);
   signal(SIGINT, &term_handler);
-  signal(SIGHUP, &sighup_handler);
+  worker_install_sighup_handler();
 
   /* Unified event loop: accept + clients + stream fds */
   int64_t last_tick = get_time_ms();
@@ -326,10 +328,19 @@ int worker_run_event_loop(int *listen_sockets, int num_sockets, int notif_fd) {
             connection_t *next = c->next;
 
             /* Check if disconnect was requested for this client */
-            if (c->status_index >= 0 && status_shared->clients[c->status_index].active &&
-                status_shared->clients[c->status_index].disconnect_requested) {
-              logger(LOG_INFO, "Disconnect requested for client %s via API",
-                     status_shared->clients[c->status_index].client_addr);
+            if (c->status_index >= 0) {
+              client_stats_t *status_client = &status_shared->clients[c->status_index];
+              uint32_t requested_generation =
+                  atomic_load_explicit(&status_client->disconnect_requested, memory_order_acquire);
+              uint32_t current_generation = atomic_load_explicit(&status_client->generation, memory_order_acquire);
+              int disconnect_matches_client = requested_generation != 0 && requested_generation == current_generation &&
+                                              atomic_load_explicit(&status_client->active, memory_order_acquire);
+              if (!disconnect_matches_client) {
+                c = next;
+                continue;
+              }
+
+              logger(LOG_INFO, "Disconnect requested for status slot %d via API", c->status_index);
               worker_close_and_free_connection(c);
             }
 
@@ -496,12 +507,24 @@ int worker_run_event_loop(int *listen_sockets, int num_sockets, int notif_fd) {
           int res = stream_handle_fd_event(&c->stream, fd_ready, events[e].events, now);
           if (res < 0) {
             /* Send 200 for r2h-duration request */
-            if (res == -2) {
+            if (res == STREAM_EVENT_DURATION_READY) {
               send_http_headers(c, STATUS_200, "application/json", NULL);
               char response[64];
               snprintf(response, sizeof(response), "{\"duration\": \"%0.3f\"}", c->stream.rtsp.r2h_duration_value);
 
               connection_queue_output_and_flush(c, (const uint8_t *)response, strlen(response));
+            } else if (res == STREAM_EVENT_METADATA_READY) {
+              /* A metadata probe has no RTSP media session to tear down. Close
+               * and unregister its control socket before queuing the HEAD
+               * response so a later upstream HUP cannot close the client. */
+              if (stream_context_cleanup(&c->stream) != 0) {
+                logger(LOG_ERROR, "Worker: Metadata probe unexpectedly required async cleanup");
+                http_send_503(c);
+                continue;
+              }
+              c->streaming = 0;
+              stream_send_http_headers(c, "video/mp2t", NULL);
+              connection_queue_output_and_flush(c, NULL, 0);
             } else if (!c->headers_sent && c->state != CONN_CLOSING) {
               /* Send 503 if headers not sent yet (no data ever arrived) */
               http_send_503(c);

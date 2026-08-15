@@ -13,7 +13,6 @@ Covers:
 import time
 
 import pytest
-
 from helpers import (
     MockHTTPUpstream,
     MockRTSPServer,
@@ -175,7 +174,7 @@ class TestRTSPIPv6Upstream:
             )
             assert status == 200
             assert len(body) >= 188
-            assert body[0] == 0x47, "Expected TS sync byte 0x47, got 0x%02x" % body[0]
+            assert body[0] == 0x47, f"Expected TS sync byte 0x47, got 0x{body[0]:02x}"
         finally:
             rtsp.stop()
 
@@ -211,7 +210,8 @@ class TestHTTPServerIPv6Listen:
     """rtp2httpd bound to ::1 should serve requests and validate IPv6 Hosts."""
 
     @pytest.fixture(scope="class")
-    def v6_r2h(self, r2h_binary):
+    @classmethod
+    def v6_r2h(cls, r2h_binary):
         port = find_free_port("::1")
         config = f"""\
 [global]

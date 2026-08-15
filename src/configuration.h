@@ -13,6 +13,8 @@
 #define CONFIGFILE SYSCONFDIR "/rtp2httpd.conf"
 
 #define DEFAULT_ACCESS_LOG_FORMAT "$client_addr [$time_iso8601] \"$service_url\" $service_type \"$upstream_url\""
+#define CONFIG_MAX_CLIENTS 256
+#define CONFIG_MAX_WORKERS 32
 
 typedef enum loglevel {
   LOG_FATAL = 0, /* Always shown */
@@ -44,6 +46,7 @@ typedef struct {
   loglevel_t verbosity; /* Log verbosity level (LOG_FATAL to LOG_DEBUG) */
   char *access_log;     /* Access log file path (NULL=disabled) */
   char *log_format;     /* Access log format string */
+  char *pid_file;       /* Supervisor PID file path (NULL=disabled) */
 
   /* Network and service settings */
   int udpxy;       /* Enable UDPxy URL format support (0=no, 1=yes) */
@@ -115,7 +118,7 @@ typedef struct {
   int zerocopy_on_send; /* Enable zero-copy send with MSG_ZEROCOPY (0=disabled,
                            1=enabled) */
 
-  /* STUN NAT traversal settings */
+  /* RTSP NAT traversal settings */
   char *rtsp_stun_server;      /* STUN server host:port for RTSP NAT traversal
                                   (NULL=disabled) */
   char *http_proxy_user_agent; /* Override User-Agent header for upstream HTTP

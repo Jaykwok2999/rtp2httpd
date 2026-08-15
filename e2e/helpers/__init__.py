@@ -16,6 +16,7 @@ Sub-modules:
 
 # Re-export everything so ``from helpers import X`` keeps working.
 
+from .config import build_config, build_single_service_config, write_temp_file
 from .constants import (
     BINARY_PATH,
     FIXTURES_DIR,
@@ -23,17 +24,19 @@ from .constants import (
     MCAST_ADDR,
     PROJECT_ROOT,
 )
-from .config import build_config, build_single_service_config, write_temp_file
 from .http import (
     assert_etag_cache_behavior,
     extract_catchup_source,
     get_header,
+    get_status_payload,
     get_upstream_path,
     http_get,
     http_request,
+    raw_http_request,
     stream_get,
     unix_http_get,
     unix_http_request,
+    wait_for_status_payload,
 )
 from .mock_fcc import MockFCCServer
 from .mock_http import MockHTTPUpstream, MockHTTPUpstreamSilent
@@ -43,6 +46,7 @@ from .mock_rtsp import (
     MockRTSPServerNoTeardownResponse,
     MockRTSPServerSilent,
     MockRTSPServerUDP,
+    MockRTSPServerZTE,
 )
 from .mock_stun import MockSTUNServer
 from .ports import (
@@ -70,6 +74,7 @@ __all__ = [
     "MockRTSPServerNoTeardownResponse",
     "MockRTSPServerSilent",
     "MockRTSPServerUDP",
+    "MockRTSPServerZTE",
     "MockSTUNServer",
     "MulticastSender",
     "R2HProcess",
@@ -81,16 +86,19 @@ __all__ = [
     "find_free_udp_port",
     "find_free_udp_port_pair",
     "get_header",
+    "get_status_payload",
     "get_upstream_path",
     "http_get",
     "http_request",
     "ipv6_loopback_available",
     "make_m3u_rtsp_config",
     "make_rtp_packet",
+    "raw_http_request",
     "stream_get",
     "unix_http_get",
     "unix_http_request",
     "wait_for_port",
+    "wait_for_status_payload",
     "wait_for_unix_socket",
     "write_temp_file",
 ]

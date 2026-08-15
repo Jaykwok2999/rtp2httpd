@@ -56,10 +56,17 @@ int cmd_rtsp_user_agent_set = 0;
 int cmd_cors_allow_origin_set = 0;
 int cmd_access_log_set = 0;
 int cmd_log_format_set = 0;
+int cmd_pid_file_set = 0;
 
 enum section_e { SEC_NONE = 0, SEC_BIND, SEC_SERVICES, SEC_GLOBAL };
 
-enum long_option_e { OPT_APP_PATH_PREFIX = 1000, OPT_USE_RELATIVE_PATH_IN_M3U, OPT_ACCESS_LOG, OPT_LOG_FORMAT };
+enum long_option_e {
+  OPT_APP_PATH_PREFIX = 1000,
+  OPT_USE_RELATIVE_PATH_IN_M3U,
+  OPT_ACCESS_LOG,
+  OPT_LOG_FORMAT,
+  OPT_PID_FILE
+};
 
 /* M3U parsing state variables */
 static char *inline_m3u_buffer = NULL;
@@ -141,6 +148,8 @@ static void free_config_strings(config_t *target, bool force_free) {
     safe_free_string(&target->access_log);
   if (!cmd_log_format_set || force_free)
     safe_free_string(&target->log_format);
+  if (!cmd_pid_file_set || force_free)
+    safe_free_string(&target->pid_file);
 }
 
 static int snapshot_string(char **dst, char *src, int keep_shallow) {
@@ -536,19 +545,20 @@ void parse_global_sec(char *line) {
 
   if (strcasecmp("maxclients", param) == 0) {
     if (set_if_not_cmd_override(cmd_maxclients_set, "maxclients")) {
-      if (atoi(value) < 1) {
-        logger(LOG_ERROR, "Invalid maxclients! Ignoring.");
+      int max_clients = atoi(value);
+      if (max_clients < 1 || max_clients > CONFIG_MAX_CLIENTS) {
+        logger(LOG_ERROR, "Invalid maxclients! Must be between 1 and %d. Ignoring.", CONFIG_MAX_CLIENTS);
         return;
       }
-      config.maxclients = atoi(value);
+      config.maxclients = max_clients;
     }
     return;
   }
 
   if (strcasecmp("workers", param) == 0) {
     int n = atoi(value);
-    if (n < 1) {
-      logger(LOG_ERROR, "Invalid workers value! Must be >= 1. Ignoring.");
+    if (n < 1 || n > CONFIG_MAX_WORKERS) {
+      logger(LOG_ERROR, "Invalid workers value! Must be between 1 and %d. Ignoring.", CONFIG_MAX_WORKERS);
       return;
     }
     config.workers = n;
@@ -797,6 +807,15 @@ void parse_global_sec(char *line) {
       safe_free_string(&config.log_format);
       if (value[0] != '\0')
         config.log_format = strdup(value);
+    }
+    return;
+  }
+
+  if (strcasecmp("pid-file", param) == 0) {
+    if (set_if_not_cmd_override(cmd_pid_file_set, "pid-file")) {
+      safe_free_string(&config.pid_file);
+      if (value[0] != '\0')
+        config.pid_file = strdup(value);
     }
     return;
   }
@@ -1076,6 +1095,7 @@ int config_snapshot(config_t *snapshot) {
   snapshot->cors_allow_origin = NULL;
   snapshot->access_log = NULL;
   snapshot->log_format = NULL;
+  snapshot->pid_file = NULL;
 
 #define SNAPSHOT_STRING(field, cmd_flag)                                                                               \
   do {                                                                                                                 \
@@ -1100,6 +1120,7 @@ int config_snapshot(config_t *snapshot) {
   SNAPSHOT_STRING(cors_allow_origin, cmd_cors_allow_origin_set);
   SNAPSHOT_STRING(access_log, cmd_access_log_set);
   SNAPSHOT_STRING(log_format, cmd_log_format_set);
+  SNAPSHOT_STRING(pid_file, cmd_pid_file_set);
 
 #undef SNAPSHOT_STRING
 
@@ -1226,14 +1247,7 @@ int config_reload(int *out_bind_changed) {
   /* Step 3: Parse config file */
   if (parse_config_file(config_file_path) != 0) {
     logger(LOG_ERROR, "Failed to parse config file during reload: %s", config_file_path);
-    /* Restore old bind addresses */
-    if (!cmd_bind_set) {
-      bind_addresses = old_bind_addresses;
-      old_bind_addresses = NULL; /* Don't free it */
-    }
-    if (old_bind_addresses)
-      free_bindaddr(old_bind_addresses);
-    return -1;
+    goto reload_failed;
   }
 
   apply_bind_side_effects();
@@ -1250,6 +1264,17 @@ int config_reload(int *out_bind_changed) {
   logger(LOG_INFO, "Configuration reloaded successfully from %s", config_file_path);
 
   return 0;
+
+reload_failed:
+  /* Restore the bind addresses captured before the failed reload */
+  if (!cmd_bind_set) {
+    free_bindaddr(bind_addresses);
+    bind_addresses = old_bind_addresses;
+    old_bind_addresses = NULL; /* Now owned by the global */
+  }
+  if (old_bind_addresses)
+    free_bindaddr(old_bind_addresses);
+  return -1;
 }
 
 void usage(FILE *f, char *progname) {
@@ -1283,6 +1308,7 @@ void usage(FILE *f, char *progname) {
           "\t-c --config <file>   Read this file for configuration, instead of the "
           "default one\n"
           "\t-C --noconfig        Do not read the default config\n"
+          "\t   --pid-file <path> Write and lock the supervisor PID file\n"
           "\t-P --fcc-listen-port-range <start[-end]>  Restrict FCC UDP listen "
           "sockets to specific ports\n"
           "\t-H --hostname <hostname> Hostname to check in the Host: HTTP header "
@@ -1414,6 +1440,7 @@ void parse_cmd_line(int argc, char *argv[]) {
                                     {"cors-allow-origin", required_argument, 0, 'O'},
                                     {"access-log", required_argument, 0, OPT_ACCESS_LOG},
                                     {"log-format", required_argument, 0, OPT_LOG_FORMAT},
+                                    {"pid-file", required_argument, 0, OPT_PID_FILE},
                                     {0, 0, 0, 0}};
 
   const char short_opts[] = "v:qhUm:w:b:B:c:l:P:H:XT:i:f:t:r:y:R:F:A:s:p:M:I:SCZg:N:u:O:";
@@ -1444,22 +1471,26 @@ void parse_cmd_line(int argc, char *argv[]) {
       config.udpxy = 0;
       cmd_udpxy_set = 1;
       break;
-    case 'm':
-      if (atoi(optarg) < 1) {
-        logger(LOG_ERROR, "Invalid maxclients! Ignoring.");
+    case 'm': {
+      int max_clients = atoi(optarg);
+      if (max_clients < 1 || max_clients > CONFIG_MAX_CLIENTS) {
+        logger(LOG_ERROR, "Invalid maxclients! Must be between 1 and %d. Ignoring.", CONFIG_MAX_CLIENTS);
       } else {
-        config.maxclients = atoi(optarg);
+        config.maxclients = max_clients;
         cmd_maxclients_set = 1;
       }
       break;
-    case 'w':
-      if (atoi(optarg) < 1) {
-        logger(LOG_ERROR, "Invalid workers! Ignoring.");
+    }
+    case 'w': {
+      int worker_count = atoi(optarg);
+      if (worker_count < 1 || worker_count > CONFIG_MAX_WORKERS) {
+        logger(LOG_ERROR, "Invalid workers! Must be between 1 and %d. Ignoring.", CONFIG_MAX_WORKERS);
       } else {
-        config.workers = atoi(optarg);
+        config.workers = worker_count;
         cmd_workers_set = 1;
       }
       break;
+    }
     case 'b':
       if (atoi(optarg) < 1) {
         logger(LOG_ERROR, "Invalid buffer-pool-max-size! Ignoring.");
@@ -1643,6 +1674,13 @@ void parse_cmd_line(int argc, char *argv[]) {
         config.log_format = strdup(optarg);
       }
       cmd_log_format_set = 1;
+      break;
+    case OPT_PID_FILE:
+      safe_free_string(&config.pid_file);
+      if (optarg[0] != '\0') {
+        config.pid_file = strdup(optarg);
+      }
+      cmd_pid_file_set = 1;
       break;
     default:
       logger(LOG_FATAL, "Unknown option! %d ", opt);

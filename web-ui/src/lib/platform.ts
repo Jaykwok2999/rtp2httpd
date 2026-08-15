@@ -2,45 +2,31 @@
  * Platform detection helpers for the web player UI.
  */
 
-/** Match iOS/iPadOS version token in WebKit UA (survives some UA reductions). */
-const IOS_CPU_OS = /CPU (?:iPhone )?OS \d+[_\d]* like Mac OS X/;
+/** Detect iOS and iPadOS devices for player defaults and platform workarounds. */
+export function isIOS(): boolean {
+  return document.documentElement.dataset.playerPlatform === "ios";
+}
 
-/** Third-party browsers on iOS/iPadOS (all use WebKit). */
-const IOS_BROWSER = /EdgiOS|CriOS|FxiOS|OPiOS/;
+/** Detect LG TV browsers that should use the platform-native media pipeline. */
+export function isLGWebOS(): boolean {
+  return document.documentElement.dataset.playerPlatform === "lg-webos";
+}
+
+/** Whether the current browser is a desktop-class device eligible for MSE video processing. */
+export function isDesktopDevice(): boolean {
+  return document.documentElement.dataset.playerPlatform === "desktop";
+}
 
 /**
- * Detect iOS and iPadOS devices for player defaults and platform workarounds.
+ * Whether `HTMLMediaElement.volume` actually affects playback.
  *
- * Covers classic mobile UA, iPadOS desktop UA (Macintosh), and iOS browser
- * wrappers that may omit the device name.
+ * iOS and iPadOS ignore volume writes because the level belongs to the hardware buttons;
+ * `muted` stays settable, so muting still works. Feature-detecting this does not work:
+ * assigning to a detached element's `volume` reads the value back unchanged, so a probe
+ * reports support that playback then does not honour. Hence the UA check, reusing the
+ * platform tag that `player.html` sets — it also covers iOS-wrapped browsers (CriOS,
+ * FxiOS, ...) and iPadOS reporting itself as MacIntel.
  */
-export function isIOS(): boolean {
-  if (typeof navigator === "undefined") {
-    return false;
-  }
-
-  const ua = navigator.userAgent;
-
-  if (/iPhone|iPad|iPod/.test(ua)) {
-    return true;
-  }
-
-  if (IOS_CPU_OS.test(ua)) {
-    return true;
-  }
-
-  if (IOS_BROWSER.test(ua)) {
-    return true;
-  }
-
-  // iPadOS 13+ "Request Desktop Website" reports as Mac with touch input.
-  if (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1) {
-    return true;
-  }
-
-  if (navigator.userAgentData?.platform === "iOS") {
-    return true;
-  }
-
-  return false;
+export function isVolumeControlSupported(): boolean {
+  return !isIOS();
 }
